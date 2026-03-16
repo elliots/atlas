@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 //go:build !ent
 
@@ -95,6 +97,38 @@ func (s *state) plan(changes []schema.Change) error {
 			s.renameTable(c)
 		case *schema.DropTable:
 			err = s.dropTable(c)
+		case *schema.AddView:
+			err = s.addView(c)
+		case *schema.DropView:
+			err = s.dropView(c)
+		case *schema.ModifyView:
+			err = s.modifyView(c)
+		case *schema.RenameView:
+			s.renameView(c)
+		case *schema.AddFunc:
+			err = s.addFunc(c)
+		case *schema.DropFunc:
+			err = s.dropFunc(c)
+		case *schema.ModifyFunc:
+			err = s.modifyFunc(c)
+		case *schema.RenameFunc:
+			err = s.renameFunc(c)
+		case *schema.AddProc:
+			err = s.addProc(c)
+		case *schema.DropProc:
+			err = s.dropProc(c)
+		case *schema.ModifyProc:
+			err = s.modifyProc(c)
+		case *schema.RenameProc:
+			err = s.renameProc(c)
+		case *schema.AddTrigger:
+			err = s.addTrigger(c)
+		case *schema.DropTrigger:
+			err = s.dropTrigger(c)
+		case *schema.ModifyTrigger:
+			err = s.modifyTrigger(c)
+		case *schema.RenameTrigger:
+			err = s.renameTrigger(c)
 		case *schema.AddObject:
 			err = s.addObject(c)
 		case *schema.ModifyObject:

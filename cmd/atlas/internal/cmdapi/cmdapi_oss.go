@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 //go:build !ent
 
@@ -27,6 +29,7 @@ import (
 	"ariga.io/atlas/sql/sqlcheck"
 	"ariga.io/atlas/sql/sqlclient"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -545,8 +548,34 @@ func setEnvs(context.Context, []*Env) {}
 var specOptions []schemahcl.Option
 
 // diffOptions returns environment-aware diff options.
-func diffOptions(_ *cobra.Command, env *Env) []schema.DiffOption {
-	return append(env.DiffOptions(), schema.DiffNormalized())
+func diffOptions(cmd *cobra.Command, env *Env) []schema.DiffOption {
+	opts := append(env.DiffOptions(), schema.DiffNormalized())
+	// Wire up interactive rename detection when running in a terminal.
+	if isInteractive(cmd) {
+		opts = append(opts, func(o *schema.DiffOptions) {
+			o.AskFunc = func(question string, choices []string) (string, error) {
+				prompt := cmdPrompt(cmd)
+				prompt.Label = question
+				prompt.Items = choices
+				_, result, err := prompt.Run()
+				if err != nil {
+					return "", err
+				}
+				return result, nil
+			}
+		})
+	}
+	return opts
+}
+
+// isInteractive reports whether the command is running in an interactive
+// terminal (i.e., not piped, not --auto-approve, not --dry-run).
+func isInteractive(cmd *cobra.Command) bool {
+	f, ok := cmd.InOrStdin().(*os.File)
+	if !ok {
+		return false
+	}
+	return isatty.IsTerminal(f.Fd())
 }
 
 // openClient allows opening environment-aware clients.

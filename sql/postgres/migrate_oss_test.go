@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 //go:build !ent
 
@@ -1847,14 +1849,305 @@ func TestPlanChanges(t *testing.T) {
 				},
 			},
 		},
-		// Adding view is not supported in OSS.
+		// View: add.
 		{
 			changes: []schema.Change{
 				&schema.AddView{
 					V: schema.NewView("v1", "SELECT * FROM users"),
 				},
 			},
-			wantErr: true,
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE VIEW "v1" AS SELECT * FROM users`,
+						Reverse: `DROP VIEW "v1"`,
+					},
+				},
+			},
+		},
+		// View: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropView{
+					V: schema.NewView("v1", "SELECT * FROM users"),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP VIEW "v1"`,
+					},
+				},
+			},
+		},
+		// View: modify (drop + create).
+		{
+			changes: []schema.Change{
+				&schema.ModifyView{
+					From: schema.NewView("v1", "SELECT id FROM users"),
+					To:   schema.NewView("v1", "SELECT id, name FROM users"),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP VIEW "v1"`,
+					},
+					{
+						Cmd:     `CREATE VIEW "v1" AS SELECT id, name FROM users`,
+						Reverse: `DROP VIEW "v1"`,
+					},
+				},
+			},
+		},
+		// View: rename.
+		{
+			changes: []schema.Change{
+				&schema.RenameView{
+					From: schema.NewView("v1", "SELECT * FROM users"),
+					To:   schema.NewView("v2", "SELECT * FROM users"),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `ALTER VIEW "v1" RENAME TO "v2"`,
+					},
+				},
+			},
+		},
+		// View: add materialized.
+		{
+			changes: []schema.Change{
+				&schema.AddView{
+					V: func() *schema.View {
+						v := schema.NewView("mv1", "SELECT * FROM users")
+						v.SetMaterialized(true)
+						return v
+					}(),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE MATERIALIZED VIEW "mv1" AS SELECT * FROM users`,
+						Reverse: `DROP MATERIALIZED VIEW "mv1"`,
+					},
+				},
+			},
+		},
+		// Function: add.
+		{
+			changes: []schema.Change{
+				&schema.AddFunc{
+					F: &schema.Func{Name: "my_func", Body: `CREATE OR REPLACE FUNCTION public.my_func() RETURNS void LANGUAGE plpgsql AS $function$ BEGIN END; $function$`},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE OR REPLACE FUNCTION public.my_func() RETURNS void LANGUAGE plpgsql AS $function$ BEGIN END; $function$`,
+						Reverse: `DROP FUNCTION IF EXISTS "my_func"`,
+					},
+				},
+			},
+		},
+		// Function: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropFunc{
+					F: &schema.Func{Name: "my_func"},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP FUNCTION "my_func"`,
+					},
+				},
+			},
+		},
+		// Function: modify (re-create).
+		{
+			changes: []schema.Change{
+				&schema.ModifyFunc{
+					From: &schema.Func{Name: "my_func", Body: `CREATE OR REPLACE FUNCTION public.my_func() RETURNS void LANGUAGE plpgsql AS $function$ BEGIN END; $function$`},
+					To:   &schema.Func{Name: "my_func", Body: `CREATE OR REPLACE FUNCTION public.my_func() RETURNS void LANGUAGE plpgsql AS $function$ BEGIN RAISE NOTICE 'hello'; END; $function$`},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `CREATE OR REPLACE FUNCTION public.my_func() RETURNS void LANGUAGE plpgsql AS $function$ BEGIN RAISE NOTICE 'hello'; END; $function$`,
+					},
+				},
+			},
+		},
+		// Function: rename.
+		{
+			changes: []schema.Change{
+				&schema.RenameFunc{
+					From: &schema.Func{Name: "my_func"},
+					To:   &schema.Func{Name: "my_func2"},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `ALTER FUNCTION "my_func" RENAME TO "my_func2"`,
+					},
+				},
+			},
+		},
+		// Procedure: add.
+		{
+			changes: []schema.Change{
+				&schema.AddProc{
+					P: &schema.Proc{Name: "my_proc", Body: `CREATE OR REPLACE PROCEDURE public.my_proc() LANGUAGE plpgsql AS $procedure$ BEGIN END; $procedure$`},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE OR REPLACE PROCEDURE public.my_proc() LANGUAGE plpgsql AS $procedure$ BEGIN END; $procedure$`,
+						Reverse: `DROP PROCEDURE IF EXISTS "my_proc"`,
+					},
+				},
+			},
+		},
+		// Procedure: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropProc{
+					P: &schema.Proc{Name: "my_proc"},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP PROCEDURE "my_proc"`,
+					},
+				},
+			},
+		},
+		// Trigger: add.
+		{
+			changes: []schema.Change{
+				&schema.AddTrigger{
+					T: &schema.Trigger{
+						Name:  "trg_users_updated_at",
+						Table: &schema.Table{Name: "users"},
+						Body:  `CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+						Reverse: `DROP TRIGGER IF EXISTS "trg_users_updated_at" ON "users"`,
+					},
+				},
+			},
+		},
+		// Trigger: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropTrigger{
+					T: &schema.Trigger{
+						Name:  "trg_users_updated_at",
+						Table: &schema.Table{Name: "users"},
+						Body:  `CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP TRIGGER IF EXISTS "trg_users_updated_at" ON "users"`,
+					},
+				},
+			},
+		},
+		// Trigger: modify (drop + create).
+		{
+			changes: []schema.Change{
+				&schema.ModifyTrigger{
+					From: &schema.Trigger{
+						Name:  "trg_users_updated_at",
+						Table: &schema.Table{Name: "users"},
+						Body:  `CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+					},
+					To: &schema.Trigger{
+						Name:  "trg_users_updated_at",
+						Table: &schema.Table{Name: "users"},
+						Body:  `CREATE TRIGGER trg_users_updated_at AFTER UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP TRIGGER IF EXISTS "trg_users_updated_at" ON "users"`,
+					},
+					{
+						Cmd:     `CREATE TRIGGER trg_users_updated_at AFTER UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at()`,
+						Reverse: `DROP TRIGGER IF EXISTS "trg_users_updated_at" ON "users"`,
+					},
+				},
+			},
+		},
+		// Trigger: rename.
+		{
+			changes: []schema.Change{
+				&schema.RenameTrigger{
+					From: &schema.Trigger{
+						Name:  "trg_old",
+						Table: &schema.Table{Name: "users"},
+					},
+					To: &schema.Trigger{
+						Name:  "trg_new",
+						Table: &schema.Table{Name: "users"},
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `ALTER TRIGGER "trg_old" ON "users" RENAME TO "trg_new"`,
+					},
+				},
+			},
 		},
 	}
 	for i, tt := range tests {

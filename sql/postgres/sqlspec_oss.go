@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 //go:build !ent
 
@@ -364,6 +366,9 @@ var (
 			schemahcl.WithTypes("table.column.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("view.column.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("materialized.column.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("function.arg.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("function.return", TypeRegistry.Specs()),
+			schemahcl.WithTypes("procedure.arg.type", TypeRegistry.Specs()),
 			schemahcl.WithScopedEnums("view.check_option", schema.ViewCheckOptionLocal, schema.ViewCheckOptionCascaded),
 			schemahcl.WithScopedEnums("table.index.type", IndexTypeBTree, IndexTypeBRIN, IndexTypeHash, IndexTypeGIN, IndexTypeGiST, "GiST", IndexTypeSPGiST, "SPGiST"),
 			schemahcl.WithScopedEnums("table.partition.type", PartitionTypeRange, PartitionTypeList, PartitionTypeHash),
@@ -371,6 +376,13 @@ var (
 			schemahcl.WithScopedEnums("table.column.as.type", "STORED"),
 			schemahcl.WithScopedEnums("table.foreign_key.on_update", specutil.ReferenceVars...),
 			schemahcl.WithScopedEnums("table.foreign_key.on_delete", specutil.ReferenceVars...),
+			schemahcl.WithScopedEnums("trigger.action_time", string(schema.TriggerTimeBefore), string(schema.TriggerTimeAfter), string(schema.TriggerTimeInstead)),
+			schemahcl.WithScopedEnums("trigger.before.for_each", string(schema.TriggerForRow), string(schema.TriggerForStmt)),
+			schemahcl.WithScopedEnums("trigger.after.for_each", string(schema.TriggerForRow), string(schema.TriggerForStmt)),
+			schemahcl.WithScopedEnums("trigger.instead_of.for_each", string(schema.TriggerForRow), string(schema.TriggerForStmt)),
+			schemahcl.WithScopedEnums("function.lang", "SQL", "PLpgSQL", "C", "internal"),
+			schemahcl.WithScopedEnums("procedure.lang", "SQL", "PLpgSQL", "C", "internal"),
+			schemahcl.WithScopedEnums("function.arg.mode", string(schema.FuncArgModeIn), string(schema.FuncArgModeOut), string(schema.FuncArgModeInOut), string(schema.FuncArgModeVariadic)),
 			schemahcl.WithScopedEnums("table.index.on.ops", func() (ops []string) {
 				for _, op := range postgresop.Classes {
 					ops = append(ops, op.Name)
