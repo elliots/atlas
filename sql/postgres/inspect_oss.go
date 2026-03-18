@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 //go:build !ent
 
@@ -1092,6 +1094,14 @@ type (
 			T *schema.Table
 			C *schema.Column
 		}
+	}
+
+	// Extension defines a PostgreSQL extension.
+	Extension struct {
+		schema.Object
+		T       string // Extension name.
+		Schema  string // Schema the extension is installed in.
+		Version string // Extension version.
 	}
 
 	// Identity defines an identity column.

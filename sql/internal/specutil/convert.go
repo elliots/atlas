@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 package specutil
 
@@ -382,6 +384,9 @@ func Table(spec *sqlspec.Table, parent *schema.Schema, convertColumn ConvertTabl
 	if err := convertCommentFromSpec(spec, &t.Attrs); err != nil {
 		return nil, err
 	}
+	if err := convertTagsFromSpec(spec.Remain(), &t.Attrs); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -416,6 +421,9 @@ func View(spec *sqlspec.View, parent *schema.Schema, convertC ConvertViewColumnF
 	if err := convertCommentFromSpec(spec, &v.Attrs); err != nil {
 		return nil, err
 	}
+	if err := convertTagsFromSpec(spec.Remain(), &v.Attrs); err != nil {
+		return nil, err
+	}
 	if c, ok := spec.Extra.Attr("check_option"); ok {
 		o, err := c.String()
 		if err != nil {
@@ -445,6 +453,9 @@ func Column(spec *sqlspec.Column, conv ConvertTypeFunc) (*schema.Column, error) 
 	}
 	out.Type.Type = ct
 	if err := convertCommentFromSpec(spec, &out.Attrs); err != nil {
+		return nil, err
+	}
+	if err := convertTagsFromSpec(spec.Remain(), &out.Attrs); err != nil {
 		return nil, err
 	}
 	return out, err
@@ -766,6 +777,7 @@ func FromTable(t *schema.Table, colFn TableColumnSpecFunc, pkFn PrimaryKeySpecFu
 		spec.Extra.Children = append(spec.Extra.Children, &schemahcl.Resource{Attrs: []*schemahcl.Attr{deps}})
 	}
 	convertCommentFromSchema(t.Attrs, &spec.Extra.Attrs)
+	convertTagsFromSchema(t.Attrs, &spec.Extra.Children)
 	return spec, nil
 }
 
@@ -809,6 +821,7 @@ func FromView(v *schema.View, colFn ViewColumnSpecFunc, idxFn IndexSpecFunc) (*s
 		embed.Attrs = append(embed.Attrs, deps)
 	}
 	convertCommentFromSchema(v.Attrs, &embed.Attrs)
+	convertTagsFromSchema(v.Attrs, &spec.Extra.Children)
 	spec.Extra.Children = append(spec.Extra.Children, embed)
 	return spec, nil
 }
@@ -995,6 +1008,7 @@ func FromColumn(c *schema.Column, columnTypeSpec ColumnTypeSpecFunc) (*sqlspec.C
 		spec.Extra.Attrs = slices.Insert(spec.Extra.Attrs, 0, &schemahcl.Attr{K: "default", V: lv})
 	}
 	convertCommentFromSchema(c.Attrs, &spec.Extra.Attrs)
+	convertTagsFromSchema(c.Attrs, &spec.Extra.Children)
 	return spec, nil
 }
 
@@ -1379,6 +1393,43 @@ func convertCommentFromSchema(src []schema.Attr, target *[]*schemahcl.Attr) {
 	var c schema.Comment
 	if sqlx.Has(src, &c) {
 		*target = append(*target, schemahcl.StringAttr("comment", c.Text))
+	}
+}
+
+// convertTagsFromSpec extracts tag child resources from the spec and converts them to schema.Tag attributes.
+func convertTagsFromSpec(r *schemahcl.Resource, attrs *[]schema.Attr) error {
+	for _, c := range r.Children {
+		if c.Type != "tag" {
+			continue
+		}
+		tag := &schema.Tag{Name: c.Name}
+		if a, ok := c.Attr("args"); ok {
+			s, err := a.String()
+			if err != nil {
+				return err
+			}
+			tag.Args = s
+		}
+		*attrs = append(*attrs, tag)
+	}
+	return nil
+}
+
+// convertTagsFromSchema converts schema.Tag attributes to spec child resources.
+func convertTagsFromSchema(src []schema.Attr, children *[]*schemahcl.Resource) {
+	for _, a := range src {
+		t, ok := a.(*schema.Tag)
+		if !ok {
+			continue
+		}
+		r := &schemahcl.Resource{
+			Type: "tag",
+			Name: t.Name,
+		}
+		if t.Args != "" {
+			r.Attrs = append(r.Attrs, schemahcl.StringAttr("args", t.Args))
+		}
+		*children = append(*children, r)
 	}
 }
 

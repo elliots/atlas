@@ -1,6 +1,8 @@
 // Copyright 2021-present The Atlas Authors. All rights reserved.
 // This source code is licensed under the Apache 2.0 license found
 // in the LICENSE file in the root directory of this source tree.
+//
+// Modifications Copyright 2026 Elliot Shepherd
 
 package cmdext
 
@@ -105,6 +107,12 @@ func stateReaderSQL(ctx context.Context, cfg *StateReaderConfig, dir migrate.Dir
 	if err != nil {
 		return nil, err
 	}
+	// Extract @-annotation tags from SQL comments before execution,
+	// since comments are lost when SQL is executed on the dev database.
+	tagIdx, err := migrate.ExtractTags(cfg.Dev.Driver, dir)
+	if err != nil {
+		return nil, err
+	}
 	sr, err := ex.Replay(ctx, func() migrate.StateReader {
 		if cfg.Dev.URL.Schema != "" {
 			return migrate.SchemaConn(cfg.Dev, "", &schema.InspectOptions{
@@ -120,6 +128,10 @@ func stateReaderSQL(ctx context.Context, cfg *StateReaderConfig, dir migrate.Dir
 	}(), optsReplay...)
 	if err != nil && !errors.Is(err, migrate.ErrNoPendingFiles) {
 		return nil, err
+	}
+	// Apply extracted tags to the inspected schema objects.
+	if sr != nil {
+		tagIdx.ApplyTags(sr)
 	}
 	return &StateReadCloser{
 		StateReader: migrate.Realm(sr),

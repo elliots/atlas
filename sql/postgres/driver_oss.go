@@ -642,8 +642,21 @@ func (s *state) alterTableAttr(*sqlx.Builder, *schema.ModifyAttr) {
 	// unimplemented.
 }
 
-func realmObjectsSpec(*doc, *schema.Realm) error {
-	return nil // unimplemented.
+// realmObjectsSpec converts realm-level objects (extensions) to HCL spec.
+func realmObjectsSpec(d *doc, r *schema.Realm) error {
+	for _, o := range r.Objects {
+		if ext, ok := o.(*Extension); ok {
+			spec := &extension{Name: ext.T}
+			if ext.Version != "" {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringAttr("version", ext.Version))
+			}
+			if ext.Schema != "" {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringAttr("schema", ext.Schema))
+			}
+			d.Extensions = append(d.Extensions, spec)
+		}
+	}
+	return nil
 }
 
 func triggersSpec(triggers []*schema.Trigger, d *doc) error {
@@ -1372,12 +1385,176 @@ func (i *inspect) inspectFuncs(ctx context.Context, r *schema.Realm, opts *schem
 	return rows.Err()
 }
 
-func (*inspect) inspectTypes(context.Context, *schema.Realm, *schema.InspectOptions) error {
-	return nil // unimplemented.
+// inspectTypes queries pg_type for domain and composite types and attaches them to schemas.
+func (i *inspect) inspectTypes(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	// Inspect domain types.
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(domainsQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying domain types: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			ns, name, baseType string
+			notNull            bool
+			dflt               sql.NullString
+		)
+		if err := rows.Scan(&ns, &name, &baseType, &notNull, &dflt); err != nil {
+			return fmt.Errorf("postgres: scanning domain type: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for domain %q not found", ns, name)
+		}
+		typ, err := ParseType(baseType)
+		if err != nil {
+			typ = &schema.UnsupportedType{T: baseType}
+		}
+		d := &DomainType{
+			T:      name,
+			Schema: s,
+			Null:   !notNull,
+			Type:   typ,
+		}
+		if dflt.Valid {
+			d.Default = &schema.RawExpr{X: dflt.String}
+		}
+		s.Objects = append(s.Objects, d)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Inspect domain check constraints.
+	chkRows, err := i.QueryContext(ctx, fmt.Sprintf(domainChecksQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying domain checks: %w", err)
+	}
+	defer chkRows.Close()
+	for chkRows.Next() {
+		var ns, typName, conName, expr string
+		if err := chkRows.Scan(&ns, &typName, &conName, &expr); err != nil {
+			return fmt.Errorf("postgres: scanning domain check: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			continue
+		}
+		for _, o := range s.Objects {
+			if d, ok := o.(*DomainType); ok && d.T == typName {
+				d.Checks = append(d.Checks, &schema.Check{
+					Name: conName,
+					Expr: expr,
+				})
+				break
+			}
+		}
+	}
+	if err := chkRows.Err(); err != nil {
+		return err
+	}
+	// Inspect composite types.
+	rows2, err := i.QueryContext(ctx, fmt.Sprintf(compositesQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying composite types: %w", err)
+	}
+	defer rows2.Close()
+	composites := make(map[string]*CompositeType)
+	for rows2.Next() {
+		var (
+			ns, typName, fieldName, fieldType string
+		)
+		if err := rows2.Scan(&ns, &typName, &fieldName, &fieldType); err != nil {
+			return fmt.Errorf("postgres: scanning composite type: %w", err)
+		}
+		key := ns + "." + typName
+		ct, ok := composites[key]
+		if !ok {
+			s, ok := r.Schema(ns)
+			if !ok {
+				return fmt.Errorf("postgres: schema %q for composite %q not found", ns, typName)
+			}
+			ct = &CompositeType{T: typName, Schema: s}
+			composites[key] = ct
+			s.Objects = append(s.Objects, ct)
+		}
+		ft, err := ParseType(fieldType)
+		if err != nil {
+			ft = &schema.UnsupportedType{T: fieldType}
+		}
+		ct.Fields = append(ct.Fields, &schema.Column{
+			Name: fieldName,
+			Type: &schema.ColumnType{Raw: fieldType, Type: ft},
+		})
+	}
+	return rows2.Err()
 }
 
-func (*inspect) inspectObjects(context.Context, *schema.Realm, *schema.InspectOptions) error {
-	return nil // unimplemented.
+// inspectObjects queries pg_sequences for independent sequences and attaches them to schemas.
+func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(sequencesQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying sequences: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			ns, name, seqType string
+			start, increment  int64
+			cache             int64
+			minV, maxV        sql.NullInt64
+			cycle             bool
+			ownerTable        sql.NullString
+			ownerColumn       sql.NullString
+		)
+		if err := rows.Scan(&ns, &name, &seqType, &start, &increment, &cache, &minV, &maxV, &cycle, &ownerTable, &ownerColumn); err != nil {
+			return fmt.Errorf("postgres: scanning sequence: %w", err)
+		}
+		// Skip sequences owned by columns (serial/identity); those are managed by the column.
+		if ownerTable.Valid && ownerColumn.Valid {
+			continue
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for sequence %q not found", ns, name)
+		}
+		typ, err := ParseType(seqType)
+		if err != nil {
+			typ = &schema.UnsupportedType{T: seqType}
+		}
+		seq := &Sequence{
+			Name:      name,
+			Schema:    s,
+			Type:      typ,
+			Start:     start,
+			Increment: increment,
+			Cache:     cache,
+			Cycle:     cycle,
+		}
+		if minV.Valid {
+			v := minV.Int64
+			seq.Min = &v
+		}
+		if maxV.Valid {
+			v := maxV.Int64
+			seq.Max = &v
+		}
+		s.Objects = append(s.Objects, seq)
+	}
+	return rows.Err()
 }
 
 func (i *inspect) inspectTriggers(ctx context.Context, r *schema.Realm, opts *schema.InspectOptions) error {
@@ -1474,8 +1651,25 @@ func (*inspect) inspectDeps(context.Context, *schema.Realm, *schema.InspectOptio
 	return nil // unimplemented.
 }
 
-func (*inspect) inspectRealmObjects(context.Context, *schema.Realm, *schema.InspectOptions) error {
-	return nil // unimplemented.
+// inspectRealmObjects queries pg_extension for installed extensions.
+func (i *inspect) inspectRealmObjects(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	rows, err := i.QueryContext(ctx, extensionsQuery)
+	if err != nil {
+		return fmt.Errorf("postgres: querying extensions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, ns, version string
+		if err := rows.Scan(&name, &ns, &version); err != nil {
+			return fmt.Errorf("postgres: scanning extension: %w", err)
+		}
+		r.Objects = append(r.Objects, &Extension{
+			T:       name,
+			Schema:  ns,
+			Version: version,
+		})
+	}
+	return rows.Err()
 }
 
 func (s *state) addView(add *schema.AddView) error {
@@ -1650,8 +1844,37 @@ func (s *state) addObject(add *schema.AddObject) error {
 			Reverse: drop,
 			Comment: fmt.Sprintf("create enum type %q", o.T),
 		})
-	default:
-		// unsupported object type.
+	case *Sequence:
+		create, drop := s.createDropSequence(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create sequence %q", o.Name),
+		})
+	case *DomainType:
+		create, drop := s.createDropDomain(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create domain type %q", o.T),
+		})
+	case *CompositeType:
+		create, drop := s.createDropComposite(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create composite type %q", o.T),
+		})
+	case *Extension:
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", o.T),
+			Reverse: fmt.Sprintf("DROP EXTENSION IF EXISTS %q", o.T),
+			Comment: fmt.Sprintf("create extension %q", o.T),
+		})
 	}
 	return nil
 }
@@ -1666,8 +1889,37 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 			Reverse: create,
 			Comment: fmt.Sprintf("drop enum type %q", o.T),
 		})
-	default:
-		// unsupported object type.
+	case *Sequence:
+		create, dropS := s.createDropSequence(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropS,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop sequence %q", o.Name),
+		})
+	case *DomainType:
+		create, dropD := s.createDropDomain(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropD,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop domain type %q", o.T),
+		})
+	case *CompositeType:
+		create, dropC := s.createDropComposite(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropC,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop composite type %q", o.T),
+		})
+	case *Extension:
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     fmt.Sprintf("DROP EXTENSION IF EXISTS %q", o.T),
+			Reverse: fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", o.T),
+			Comment: fmt.Sprintf("drop extension %q", o.T),
+		})
 	}
 	return nil
 }
@@ -1677,6 +1929,86 @@ func (s *state) modifyObject(modify *schema.ModifyObject) error {
 		return s.alterEnum(modify)
 	}
 	return nil // unimplemented.
+}
+
+// mustFormat formats a schema.Type to its SQL string, returning an empty string on error.
+func mustFormat(t schema.Type) string {
+	s, _ := FormatType(t)
+	return s
+}
+
+// createDropSequence returns CREATE and DROP statements for a sequence.
+func (s *state) createDropSequence(seq *Sequence) (string, string) {
+	b := s.Build("CREATE SEQUENCE")
+	b.SchemaResource(seq.Schema, seq.Name)
+	if seq.Type != nil {
+		b.P("AS", mustFormat(seq.Type))
+	}
+	b.P("START WITH", strconv.FormatInt(seq.Start, 10))
+	b.P("INCREMENT BY", strconv.FormatInt(seq.Increment, 10))
+	if seq.Min != nil {
+		b.P("MINVALUE", strconv.FormatInt(*seq.Min, 10))
+	} else {
+		b.P("NO MINVALUE")
+	}
+	if seq.Max != nil {
+		b.P("MAXVALUE", strconv.FormatInt(*seq.Max, 10))
+	} else {
+		b.P("NO MAXVALUE")
+	}
+	if seq.Cache > 1 {
+		b.P("CACHE", strconv.FormatInt(seq.Cache, 10))
+	}
+	if seq.Cycle {
+		b.P("CYCLE")
+	}
+	create := b.String()
+	drop := s.Build("DROP SEQUENCE IF EXISTS").SchemaResource(seq.Schema, seq.Name).String()
+	return create, drop
+}
+
+// createDropDomain returns CREATE and DROP statements for a domain type.
+func (s *state) createDropDomain(d *DomainType) (string, string) {
+	b := s.Build("CREATE DOMAIN")
+	b.SchemaResource(d.Schema, d.T)
+	b.P("AS", mustFormat(d.Type))
+	if !d.Null {
+		b.P("NOT NULL")
+	}
+	if d.Default != nil {
+		if raw, ok := d.Default.(*schema.RawExpr); ok {
+			b.P("DEFAULT", raw.X)
+		}
+	}
+	for _, ck := range d.Checks {
+		expr := ck.Expr
+		// pg_get_constraintdef returns "CHECK (...)" — use it directly.
+		if strings.HasPrefix(strings.ToUpper(expr), "CHECK") {
+			b.P("CONSTRAINT").Ident(ck.Name).P(expr)
+		} else {
+			b.P("CONSTRAINT").Ident(ck.Name).P("CHECK (").P(expr).P(")")
+		}
+	}
+	create := b.String()
+	drop := s.Build("DROP DOMAIN IF EXISTS").SchemaResource(d.Schema, d.T).String()
+	return create, drop
+}
+
+// createDropComposite returns CREATE and DROP statements for a composite type.
+func (s *state) createDropComposite(c *CompositeType) (string, string) {
+	b := s.Build("CREATE TYPE")
+	b.SchemaResource(c.Schema, c.T)
+	b.P("AS (")
+	for i, f := range c.Fields {
+		if i > 0 {
+			b.Comma()
+		}
+		b.Ident(f.Name).P(mustFormat(f.Type.Type))
+	}
+	b.P(")")
+	create := b.String()
+	drop := s.Build("DROP TYPE IF EXISTS").SchemaResource(c.Schema, c.T).String()
+	return create, drop
 }
 
 func (s *state) addTrigger(add *schema.AddTrigger) error {
@@ -1746,43 +2078,110 @@ func (*diff) ViewAttrChanges(from, to *schema.View) []schema.Change {
 
 // RealmObjectDiff returns a changeset for migrating realm (database) objects
 // from one state to the other. For example, adding extensions or users.
-func (*diff) RealmObjectDiff(_, _ *schema.Realm) ([]schema.Change, error) {
-	return nil, nil // unimplemented.
+func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
+	var changes []schema.Change
+	// Drop extensions.
+	for _, o1 := range from.Objects {
+		e1, ok := o1.(*Extension)
+		if !ok {
+			continue
+		}
+		if _, ok := to.Object(func(o schema.Object) bool {
+			e2, ok := o.(*Extension)
+			return ok && e1.T == e2.T
+		}); !ok {
+			changes = append(changes, &schema.DropObject{O: o1})
+		}
+	}
+	// Add extensions.
+	for _, o1 := range to.Objects {
+		e1, ok := o1.(*Extension)
+		if !ok {
+			continue
+		}
+		if _, ok := from.Object(func(o schema.Object) bool {
+			e2, ok := o.(*Extension)
+			return ok && e1.T == e2.T
+		}); !ok {
+			changes = append(changes, &schema.AddObject{O: e1})
+		}
+	}
+	return changes, nil
 }
 
 // SchemaObjectDiff returns a changeset for migrating schema objects from
 // one state to the other.
 func (d *diff) SchemaObjectDiff(from, to *schema.Schema, opts *schema.DiffOptions) ([]schema.Change, error) {
 	var changes []schema.Change
-	// Drop or modify enums.
+	// Drop or modify existing objects.
 	for _, o1 := range from.Objects {
-		e1, ok := o1.(*schema.EnumType)
-		if !ok {
-			continue // Unsupported object type.
-		}
-		o2, ok := to.Object(func(o schema.Object) bool {
-			e2, ok := o.(*schema.EnumType)
-			return ok && e1.T == e2.T
-		})
-		if !ok {
-			changes = append(changes, &schema.DropObject{O: o1})
-			continue
-		}
-		if e2 := o2.(*schema.EnumType); !sqlx.ValuesEqual(e1.Values, e2.Values) {
-			changes = append(changes, &schema.ModifyObject{From: e1, To: e2})
+		switch v1 := o1.(type) {
+		case *schema.EnumType:
+			o2, ok := to.Object(func(o schema.Object) bool {
+				e2, ok := o.(*schema.EnumType)
+				return ok && v1.T == e2.T
+			})
+			if !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+				continue
+			}
+			if e2 := o2.(*schema.EnumType); !sqlx.ValuesEqual(v1.Values, e2.Values) {
+				changes = append(changes, &schema.ModifyObject{From: v1, To: e2})
+			}
+		case *DomainType:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				d2, ok := o.(*DomainType)
+				return ok && v1.T == d2.T
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
+		case *CompositeType:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				c2, ok := o.(*CompositeType)
+				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
+		case *Sequence:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				s2, ok := o.(*Sequence)
+				return ok && v1.Name == s2.Name
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
 		}
 	}
-	// Add new enums.
+	// Add new objects.
 	for _, o1 := range to.Objects {
-		e1, ok := o1.(*schema.EnumType)
-		if !ok {
-			continue // Unsupported object type.
-		}
-		if _, ok := from.Object(func(o schema.Object) bool {
-			e2, ok := o.(*schema.EnumType)
-			return ok && e1.T == e2.T
-		}); !ok {
-			changes = append(changes, &schema.AddObject{O: e1})
+		switch v1 := o1.(type) {
+		case *schema.EnumType:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				e2, ok := o.(*schema.EnumType)
+				return ok && v1.T == e2.T
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *DomainType:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				d2, ok := o.(*DomainType)
+				return ok && v1.T == d2.T
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *CompositeType:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				c2, ok := o.(*CompositeType)
+				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *Sequence:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				s2, ok := o.(*Sequence)
+				return ok && v1.Name == s2.Name
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
 		}
 	}
 	return changes, nil
@@ -1852,11 +2251,90 @@ func verifyChanges(_ context.Context, changes []schema.Change) error {
 	return nil
 }
 
-func convertDomains(_ []*sqlspec.Table, domains []*domain, _ *schema.Realm) error {
-	if len(domains) > 0 {
-		return fmt.Errorf("postgres: domains are not supported by this version. Use: https://atlasgo.io/getting-started")
+// convertDomains converts domain HCL specs to schema.DomainType objects and
+// resolves column type references pointing to domains.
+func convertDomains(tables []*sqlspec.Table, domains []*domain, r *schema.Realm) error {
+	if len(domains) == 0 {
+		return nil
+	}
+	byName := make(map[string]*DomainType)
+	for _, d := range domains {
+		ns, err := specutil.SchemaName(d.Schema)
+		if err != nil {
+			return fmt.Errorf("extract schema name from domain reference: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("schema %q defined on domain %q was not found in realm", ns, d.Name)
+		}
+		dt := &DomainType{T: d.Name, Schema: s, Null: d.Null}
+		if d.Type != nil {
+			t, err := TypeRegistry.Type(d.Type, nil)
+			if err != nil {
+				return fmt.Errorf("resolve domain %q base type: %w", d.Name, err)
+			}
+			dt.Type = t
+		}
+		if d.Default != (cty.Value{}) && !d.Default.IsNull() {
+			expr, err := specutil.Default(d.Default)
+			if err != nil {
+				return fmt.Errorf("resolve domain %q default: %w", d.Name, err)
+			}
+			dt.Default = expr
+		}
+		for _, ck := range d.Checks {
+			dt.Checks = append(dt.Checks, &schema.Check{Name: ck.Name, Expr: ck.Expr})
+		}
+		s.AddObjects(dt)
+		byName[d.Name] = dt
+	}
+	// Resolve column type references to domains.
+	for _, t := range tables {
+		for _, c := range t.Columns {
+			if !c.Type.IsRefTo("domain") {
+				continue
+			}
+			name, err := domainName(c.Type)
+			if err != nil {
+				return err
+			}
+			dt, ok := byName[name]
+			if !ok {
+				return fmt.Errorf("domain %q was not found in realm", name)
+			}
+			schemaT, err := specutil.SchemaName(t.Schema)
+			if err != nil {
+				continue
+			}
+			ts, ok := r.Schema(schemaT)
+			if !ok {
+				continue
+			}
+			tt, ok := ts.Table(t.Name)
+			if !ok {
+				continue
+			}
+			cc, ok := tt.Column(c.Name)
+			if !ok {
+				continue
+			}
+			cc.Type.Type = dt
+		}
 	}
 	return nil
+}
+
+// domainName extracts the domain name from a type reference.
+func domainName(t *schemahcl.Type) (string, error) {
+	ref := &schemahcl.Ref{V: t.T}
+	parts, err := ref.ByType("domain")
+	if err != nil {
+		return "", err
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("empty domain reference")
+	}
+	return parts[len(parts)-1], nil
 }
 
 func convertAggregate(d *doc, _ *schema.Realm) error {
@@ -1866,9 +2344,52 @@ func convertAggregate(d *doc, _ *schema.Realm) error {
 	return nil
 }
 
-func convertSequences(_ []*sqlspec.Table, seqs []*sqlspec.Sequence, _ *schema.Realm) error {
-	if len(seqs) > 0 {
-		return fmt.Errorf("postgres: sequences are not supported by this version. Use: https://atlasgo.io/getting-started")
+// convertSequences converts sequence HCL specs to postgres Sequence objects.
+func convertSequences(_ []*sqlspec.Table, seqs []*sqlspec.Sequence, r *schema.Realm) error {
+	for _, seq := range seqs {
+		ns, err := specutil.SchemaName(seq.Schema)
+		if err != nil {
+			return fmt.Errorf("extract schema name from sequence reference: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("schema %q defined on sequence %q was not found in realm", ns, seq.Name)
+		}
+		ps := &Sequence{Name: seq.Name, Schema: s}
+		if a, ok := seq.Attr("start"); ok {
+			v, _ := a.Int64()
+			ps.Start = v
+		}
+		if a, ok := seq.Attr("increment"); ok {
+			v, _ := a.Int64()
+			ps.Increment = v
+		}
+		if a, ok := seq.Attr("cache"); ok {
+			v, _ := a.Int64()
+			ps.Cache = v
+		}
+		if a, ok := seq.Attr("cycle"); ok {
+			v, _ := a.Bool()
+			ps.Cycle = v
+		}
+		if a, ok := seq.Attr("min"); ok {
+			v, _ := a.Int64()
+			ps.Min = &v
+		}
+		if a, ok := seq.Attr("max"); ok {
+			v, _ := a.Int64()
+			ps.Max = &v
+		}
+		if a, ok := seq.Attr("type"); ok {
+			typ, err := a.Type()
+			if err == nil {
+				t, err := TypeRegistry.Type(typ, nil)
+				if err == nil {
+					ps.Type = t
+				}
+			}
+		}
+		s.AddObjects(ps)
 	}
 	return nil
 }
@@ -1880,9 +2401,47 @@ func convertPolicies(_ []*sqlspec.Table, ps []*policy, _ *schema.Realm) error {
 	return nil
 }
 
-func convertExtensions(exs []*extension, _ *schema.Realm) error {
-	if len(exs) > 0 {
-		return fmt.Errorf("postgres: extensions are not supported by this version. Use: https://atlasgo.io/getting-started")
+// convertComposites converts composite HCL specs to CompositeType objects.
+func convertComposites(composites []*composite, r *schema.Realm) error {
+	for _, c := range composites {
+		ns, err := specutil.SchemaName(c.Schema)
+		if err != nil {
+			return fmt.Errorf("extract schema name from composite reference: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("schema %q defined on composite %q was not found in realm", ns, c.Name)
+		}
+		ct := &CompositeType{T: c.Name, Schema: s}
+		for _, f := range c.Fields {
+			if f.Type == nil {
+				continue
+			}
+			t, err := TypeRegistry.Type(f.Type, nil)
+			if err != nil {
+				return fmt.Errorf("resolve composite %q field %q type: %w", c.Name, f.Name, err)
+			}
+			ct.Fields = append(ct.Fields, &schema.Column{
+				Name: f.Name,
+				Type: &schema.ColumnType{Type: t},
+			})
+		}
+		s.AddObjects(ct)
+	}
+	return nil
+}
+
+// convertExtensions converts extension HCL specs to Extension objects on the realm.
+func convertExtensions(exs []*extension, r *schema.Realm) error {
+	for _, e := range exs {
+		ext := &Extension{T: e.Name}
+		if a, ok := e.Attr("version"); ok {
+			ext.Version, _ = a.String()
+		}
+		if a, ok := e.Attr("schema"); ok {
+			ext.Schema, _ = a.String()
+		}
+		r.Objects = append(r.Objects, ext)
 	}
 	return nil
 }
@@ -1898,19 +2457,98 @@ func normalizeRealm(*schema.Realm) error {
 	return nil
 }
 
-func schemasObjectSpec(*doc, ...*schema.Schema) error {
-	return nil // unimplemented.
+func schemasObjectSpec(d *doc, schemas ...*schema.Schema) error {
+	for _, s := range schemas {
+		ref := specutil.SchemaRef(s.Name)
+		for _, o := range s.Objects {
+			switch o := o.(type) {
+			case *Sequence:
+				spec := &sqlspec.Sequence{
+					Name:   o.Name,
+					Schema: ref,
+				}
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.Int64Attr("start", o.Start))
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.Int64Attr("increment", o.Increment))
+				if o.Cache > 1 {
+					spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.Int64Attr("cache", o.Cache))
+				}
+				if o.Cycle {
+					spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("cycle", true))
+				}
+				if o.Min != nil {
+					spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.Int64Attr("min", *o.Min))
+				}
+				if o.Max != nil {
+					spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.Int64Attr("max", *o.Max))
+				}
+				if o.Type != nil {
+					c, err := columnTypeSpec(o.Type)
+					if err == nil {
+						spec.Extra.Attrs = append(spec.Extra.Attrs, specutil.TypeAttr("type", c.Type))
+					}
+				}
+				d.Sequences = append(d.Sequences, spec)
+			}
+		}
+	}
+	return nil
 }
 
 // objectSpec converts from a concrete schema objects into specs.
 func objectSpec(d *doc, spec *specutil.SchemaSpec, s *schema.Schema) error {
+	ref := specutil.SchemaRef(spec.Schema.Name)
 	for _, o := range s.Objects {
-		if e, ok := o.(*schema.EnumType); ok {
+		switch o := o.(type) {
+		case *schema.EnumType:
 			d.Enums = append(d.Enums, &enum{
-				Name:   e.T,
-				Values: e.Values,
-				Schema: specutil.SchemaRef(spec.Schema.Name),
+				Name:   o.T,
+				Values: o.Values,
+				Schema: ref,
 			})
+		case *DomainType:
+			ds := &domain{
+				Name:   o.T,
+				Schema: ref,
+				Null:   o.Null,
+			}
+			if o.Type != nil {
+				c, err := columnTypeSpec(o.Type)
+				if err != nil {
+					return err
+				}
+				ds.Type = c.Type
+			}
+			if o.Default != nil {
+				if raw, ok := o.Default.(*schema.RawExpr); ok {
+					ds.Default = schemahcl.RawExprValue(&schemahcl.RawExpr{X: raw.X})
+				}
+			}
+			for _, ck := range o.Checks {
+				ds.Checks = append(ds.Checks, &sqlspec.Check{
+					Name: ck.Name,
+					Expr: ck.Expr,
+				})
+			}
+			d.Domains = append(d.Domains, ds)
+		case *CompositeType:
+			cs := &composite{
+				Name:   o.T,
+				Schema: ref,
+			}
+			for _, f := range o.Fields {
+				if f.Type == nil {
+					continue
+				}
+				c, err := columnTypeSpec(f.Type.Type)
+				if err != nil {
+					return err
+				}
+				cs.Fields = append(cs.Fields, &compositeField{
+					Name: f.Name,
+					Type: c.Type,
+				})
+			}
+			d.Composites = append(d.Composites, cs)
 		}
 	}
 	return nil
@@ -2142,5 +2780,102 @@ WHERE
 	AND n.nspname IN (%s)
 ORDER BY
 	n.nspname, c.relname, t.tgname
+`
+	// Query to list domain types.
+	domainsQuery = `
+SELECT
+	n.nspname AS schema_name,
+	t.typname AS type_name,
+	pg_catalog.format_type(t.typbasetype, t.typtypmod) AS base_type,
+	t.typnotnull AS not_null,
+	pg_catalog.pg_get_expr(t.typdefaultbin, 0) AS default_value
+FROM
+	pg_catalog.pg_type t
+	JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+WHERE
+	t.typtype = 'd'
+	AND n.nspname IN (%s)
+ORDER BY
+	n.nspname, t.typname
+`
+	// Query to list check constraints on domain types.
+	domainChecksQuery = `
+SELECT
+	n.nspname AS schema_name,
+	t.typname AS type_name,
+	c.conname AS constraint_name,
+	pg_catalog.pg_get_constraintdef(c.oid) AS check_expr
+FROM
+	pg_catalog.pg_constraint c
+	JOIN pg_catalog.pg_type t ON t.oid = c.contypid
+	JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+WHERE
+	c.contype = 'c'
+	AND t.typtype = 'd'
+	AND n.nspname IN (%s)
+ORDER BY
+	n.nspname, t.typname, c.conname
+`
+	// Query to list composite types and their fields.
+	compositesQuery = `
+SELECT
+	n.nspname AS schema_name,
+	t.typname AS type_name,
+	a.attname AS field_name,
+	pg_catalog.format_type(a.atttypid, a.atttypmod) AS field_type
+FROM
+	pg_catalog.pg_type t
+	JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+	JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
+	JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE
+	t.typtype = 'c'
+	AND n.nspname IN (%s)
+	AND NOT EXISTS (
+		SELECT 1 FROM pg_catalog.pg_class r
+		WHERE r.oid = t.typrelid AND r.relkind IN ('r', 'v', 'm', 'p')
+	)
+ORDER BY
+	n.nspname, t.typname, a.attnum
+`
+	// Query to list independent sequences (not owned by any column).
+	sequencesQuery = `
+SELECT
+	n.nspname AS schema_name,
+	c.relname AS sequence_name,
+	pg_catalog.format_type(s.seqtypid, NULL) AS data_type,
+	s.seqstart AS start_value,
+	s.seqincrement AS increment,
+	s.seqcache AS cache_size,
+	s.seqmin AS min_value,
+	s.seqmax AS max_value,
+	s.seqcycle AS cycle,
+	d_table.relname AS owner_table,
+	d_col.attname AS owner_column
+FROM
+	pg_catalog.pg_sequence s
+	JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = c.oid AND dep.deptype = 'a' AND dep.classid = 'pg_class'::regclass
+	LEFT JOIN pg_catalog.pg_class d_table ON d_table.oid = dep.refobjid AND dep.refclassid = 'pg_class'::regclass
+	LEFT JOIN pg_catalog.pg_attribute d_col ON d_col.attrelid = dep.refobjid AND d_col.attnum = dep.refobjsubid
+WHERE
+	n.nspname IN (%s)
+ORDER BY
+	n.nspname, c.relname
+`
+	// Query to list extensions.
+	extensionsQuery = `
+SELECT
+	e.extname AS name,
+	n.nspname AS schema_name,
+	e.extversion AS version
+FROM
+	pg_catalog.pg_extension e
+	JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE
+	e.extname != 'plpgsql'
+ORDER BY
+	e.extname
 `
 )

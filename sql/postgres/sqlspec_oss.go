@@ -234,6 +234,12 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		if err := convertTypes(&d, v); err != nil {
 			return err
 		}
+		if err := convertDomains(d.Tables, d.Domains, v); err != nil {
+			return err
+		}
+		if err := convertComposites(d.Composites, v); err != nil {
+			return err
+		}
 		if err := convertAggregate(&d, v); err != nil {
 			return err
 		}
@@ -265,6 +271,12 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 			return err
 		}
 		if err := convertTypes(&d, r); err != nil {
+			return err
+		}
+		if err := convertDomains(d.Tables, d.Domains, r); err != nil {
+			return err
+		}
+		if err := convertComposites(d.Composites, r); err != nil {
 			return err
 		}
 		if err := convertAggregate(&d, r); err != nil {
@@ -314,6 +326,9 @@ func (c *Codec) MarshalSpec(v any) ([]byte, error) {
 			}
 			d.merge(d1)
 			ts = append(ts, trs...)
+			if err := schemasObjectSpec(&d, s); err != nil {
+				return nil, err
+			}
 		}
 		if err := realmObjectsSpec(&d, rv); err != nil {
 			return nil, err
@@ -366,6 +381,9 @@ var (
 			schemahcl.WithTypes("table.column.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("view.column.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("materialized.column.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("domain.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("composite.field.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("sequence.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("function.arg.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("function.return", TypeRegistry.Specs()),
 			schemahcl.WithTypes("procedure.arg.type", TypeRegistry.Specs()),
