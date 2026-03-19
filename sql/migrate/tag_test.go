@@ -121,7 +121,7 @@ func TestStmtTags(t *testing.T) {
 	require.Equal(t, "audit.tracked", tags[1].Name)
 }
 
-func TestParseInlineTags(t *testing.T) {
+func TestParseStmtTags(t *testing.T) {
 	stmt := `CREATE TABLE public.tenant (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -140,48 +140,110 @@ func TestParseInlineTags(t *testing.T) {
     is_active boolean NOT NULL DEFAULT true
 );`
 
-	result := ParseInlineTags(stmt)
+	colTags, tableTags := ParseStmtTags(stmt)
 
-	require.Len(t, result["name"], 2)
-	require.Equal(t, "gql.filter", result["name"][0].Name)
-	require.Equal(t, "gql.order", result["name"][1].Name)
+	require.Empty(t, tableTags)
 
-	require.Len(t, result["stripe_customer_id"], 1)
-	require.Equal(t, "gql.omit", result["stripe_customer_id"][0].Name)
+	require.Len(t, colTags["name"], 2)
+	require.Equal(t, "gql.filter", colTags["name"][0].Name)
+	require.Equal(t, "gql.order", colTags["name"][1].Name)
 
-	require.Len(t, result["subscription_tier"], 1)
-	require.Equal(t, "gql.omit", result["subscription_tier"][0].Name)
+	require.Len(t, colTags["stripe_customer_id"], 1)
+	require.Equal(t, "gql.omit", colTags["stripe_customer_id"][0].Name)
+
+	require.Len(t, colTags["subscription_tier"], 1)
+	require.Equal(t, "gql.omit", colTags["subscription_tier"][0].Name)
 
 	// Columns without tags should not appear.
-	require.Nil(t, result["id"])
-	require.Nil(t, result["slug"])
-	require.Nil(t, result["is_active"])
+	require.Nil(t, colTags["id"])
+	require.Nil(t, colTags["slug"])
+	require.Nil(t, colTags["is_active"])
 }
 
-func TestParseInlineTags_QuotedColumns(t *testing.T) {
+func TestParseStmtTags_UserExample(t *testing.T) {
+	// The user's example with all tag placement patterns.
+	stmt := `-- @for("one")
+create table one ( -- @for("one again")
+
+    -- @for("two")
+    two text, -- @for("two again")
+    three text, -- @for("three")
+
+    -- @for("four")
+
+
+four numeric
+
+    -- @for("one yet again")
+
+)`
+
+	// Note: "-- @for("one")" before the statement would normally be in
+	// Stmt.Comments, not in stmt.Text. We're testing ParseStmtTags which
+	// only sees the statement text. Let's include it in the text to test
+	// the full scenario.
+	colTags, tableTags := ParseStmtTags(stmt)
+
+	// "@for("one")" is a preceding comment before CREATE TABLE → table
+	// "@for("one again")" is inline on the CREATE TABLE line → table
+	// "@for("one yet again")" is after last column, before ) → table
+	tableTagNames := tagNames(tableTags)
+	require.Contains(t, tableTagNames, "for")
+	// Count table tags: "one", "one again", "one yet again" = 3
+	require.Len(t, tableTags, 3)
+	require.Equal(t, `"one"`, tableTags[0].Args)
+	require.Equal(t, `"one again"`, tableTags[1].Args)
+	require.Equal(t, `"one yet again"`, tableTags[2].Args)
+
+	// "@for("two")" is preceding comment for column two
+	// "@for("two again")" is inline on column two's line
+	require.Len(t, colTags["two"], 2)
+	require.Equal(t, `"two"`, colTags["two"][0].Args)
+	require.Equal(t, `"two again"`, colTags["two"][1].Args)
+
+	// "@for("three")" is inline on column three's line
+	require.Len(t, colTags["three"], 1)
+	require.Equal(t, `"three"`, colTags["three"][0].Args)
+
+	// "@for("four")" is preceding comment for column four
+	require.Len(t, colTags["four"], 1)
+	require.Equal(t, `"four"`, colTags["four"][0].Args)
+}
+
+func TestParseStmtTags_QuotedColumns(t *testing.T) {
 	stmt := `CREATE TABLE test (
     -- @pii
     "user name" text NOT NULL
 );`
-	result := ParseInlineTags(stmt)
-	require.Len(t, result["user name"], 1)
-	require.Equal(t, "pii", result["user name"][0].Name)
+	colTags, tableTags := ParseStmtTags(stmt)
+	require.Empty(t, tableTags)
+	require.Len(t, colTags["user name"], 1)
+	require.Equal(t, "pii", colTags["user name"][0].Name)
 }
 
-func TestParseInlineTags_NoTags(t *testing.T) {
+func TestParseStmtTags_NoTags(t *testing.T) {
 	stmt := `CREATE TABLE test (
     id bigserial PRIMARY KEY,
     name text NOT NULL
 );`
-	result := ParseInlineTags(stmt)
-	require.Empty(t, result)
+	colTags, tableTags := ParseStmtTags(stmt)
+	require.Empty(t, tableTags)
+	require.Empty(t, colTags)
 }
 
-func TestExtractTableName(t *testing.T) {
+func TestParseStmtTags_View(t *testing.T) {
+	stmt := `CREATE VIEW active_users AS -- @gql.expose
+    SELECT id, name FROM users WHERE is_active = true;`
+	_, tableTags := ParseStmtTags(stmt)
+	require.Len(t, tableTags, 1)
+	require.Equal(t, "gql.expose", tableTags[0].Name)
+}
+
+func TestParseTableName(t *testing.T) {
 	tests := []struct {
-		stmt         string
-		wantSchema   string
-		wantTable    string
+		stmt       string
+		wantSchema string
+		wantTable  string
 	}{
 		{"CREATE TABLE tenant (id int);", "", "tenant"},
 		{"CREATE TABLE public.tenant (id int);", "public", "tenant"},
@@ -193,7 +255,7 @@ func TestExtractTableName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.stmt, func(t *testing.T) {
-			s, tn := extractTableName(tt.stmt)
+			s, tn := parseTableName(tt.stmt)
 			require.Equal(t, tt.wantSchema, s)
 			require.Equal(t, tt.wantTable, tn)
 		})
@@ -239,4 +301,12 @@ func TestApplyTags(t *testing.T) {
 
 	// id column should have no tags.
 	require.Empty(t, schema.Tags(tenant.Columns[0].Attrs))
+}
+
+func tagNames(tags []*schema.Tag) []string {
+	names := make([]string, len(tags))
+	for i, t := range tags {
+		names[i] = t.Name
+	}
+	return names
 }
