@@ -65,7 +65,9 @@ func main() {
 	if err != nil {
 		result = &Result{Error: err.Error()}
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+	// Flatten to break circular references (Schema→Table→Schema→Realm→…)
+	flat := flattenResult(result)
+	if err := json.NewEncoder(os.Stdout).Encode(flat); err != nil {
 		fatal("encode result: %v", err)
 	}
 }
