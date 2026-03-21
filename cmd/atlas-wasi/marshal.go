@@ -60,6 +60,13 @@ type flatColumnType struct {
 	IsCustom bool     `json:"is_custom,omitempty"`
 	// Enum-specific fields
 	EnumValues []string `json:"enum_values,omitempty"`
+	// Composite type fields
+	CompositeFields []flatCompositeField `json:"composite_fields,omitempty"`
+}
+
+type flatCompositeField struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type flatIndex struct {
@@ -92,8 +99,17 @@ type flatView struct {
 }
 
 type flatFunc struct {
-	Name  string `json:"name"`
-	Attrs []any  `json:"attrs,omitempty"`
+	Name   string         `json:"name"`
+	Args   []flatFuncArg  `json:"args,omitempty"`
+	Ret    *flatColumnType `json:"ret,omitempty"`
+	Lang   string         `json:"lang,omitempty"`
+	Attrs  []any          `json:"attrs,omitempty"`
+}
+
+type flatFuncArg struct {
+	Name string         `json:"name,omitempty"`
+	Type *flatColumnType `json:"type,omitempty"`
+	Mode string         `json:"mode,omitempty"`
 }
 
 type flatProc struct {
@@ -140,7 +156,32 @@ func flattenSchema(s *schema.Schema) flatSchema {
 		fs.Views = append(fs.Views, flattenView(v))
 	}
 	for _, f := range s.Funcs {
-		fs.Funcs = append(fs.Funcs, flatFunc{Name: f.Name, Attrs: flattenAttrs(f.Attrs)})
+		ff := flatFunc{Name: f.Name, Lang: f.Lang, Attrs: flattenAttrs(f.Attrs)}
+		for _, a := range f.Args {
+			fa := flatFuncArg{Name: a.Name, Mode: string(a.Mode)}
+			if a.Type != nil {
+				cat, isCust, enumVals, compFields := typeCategory(a.Type)
+				fa.Type = &flatColumnType{
+					Type:            typeString(a.Type),
+					Category:        cat,
+					IsCustom:        isCust,
+					EnumValues:      enumVals,
+					CompositeFields: compFields,
+				}
+			}
+			ff.Args = append(ff.Args, fa)
+		}
+		if f.Ret != nil {
+			cat, isCust, enumVals, compFields := typeCategory(f.Ret)
+			ff.Ret = &flatColumnType{
+				Type:            typeString(f.Ret),
+				Category:        cat,
+				IsCustom:        isCust,
+				EnumValues:      enumVals,
+				CompositeFields: compFields,
+			}
+		}
+		fs.Funcs = append(fs.Funcs, ff)
 	}
 	for _, p := range s.Procs {
 		fs.Procs = append(fs.Procs, flatProc{Name: p.Name, Attrs: flattenAttrs(p.Attrs)})
@@ -185,7 +226,7 @@ func flattenColumn(c *schema.Column) flatColumn {
 		}
 		if c.Type.Type != nil {
 			fct.Type = typeString(c.Type.Type)
-			fct.Category, fct.IsCustom, fct.EnumValues = typeCategory(c.Type.Type)
+			fct.Category, fct.IsCustom, fct.EnumValues, fct.CompositeFields = typeCategory(c.Type.Type)
 		}
 		fc.Type = fct
 	}
@@ -281,36 +322,54 @@ func flattenAttrs(attrs []schema.Attr) []any {
 // typeString extracts a readable type name from a schema.Type interface.
 // typeCategory returns the category, whether it's a custom/user-defined type,
 // and enum values (if applicable) for a schema.Type.
-func typeCategory(t schema.Type) (category string, isCustom bool, enumValues []string) {
+func typeCategory(t schema.Type) (category string, isCustom bool, enumValues []string, compositeFields []flatCompositeField) {
 	switch v := t.(type) {
 	case *schema.StringType:
-		return "string", false, nil
+		return "string", false, nil, nil
 	case *schema.IntegerType:
-		return "integer", false, nil
+		return "integer", false, nil, nil
 	case *schema.FloatType:
-		return "float", false, nil
+		return "float", false, nil, nil
 	case *schema.DecimalType:
-		return "decimal", false, nil
+		return "decimal", false, nil, nil
 	case *schema.BoolType:
-		return "boolean", false, nil
+		return "boolean", false, nil, nil
 	case *schema.TimeType:
-		return "time", false, nil
+		return "time", false, nil, nil
 	case *schema.BinaryType:
-		return "binary", false, nil
+		return "binary", false, nil, nil
 	case *schema.JSONType:
-		return "json", false, nil
+		return "json", false, nil, nil
 	case *schema.UUIDType:
-		return "uuid", false, nil
+		return "uuid", false, nil, nil
 	case *schema.SpatialType:
-		return "spatial", false, nil
+		return "spatial", false, nil, nil
 	case *schema.EnumType:
-		return "enum", true, v.Values
+		return "enum", true, v.Values, nil
 	case *schema.UnsupportedType:
-		return "unknown", true, nil
+		return "unknown", true, nil, nil
 	default:
+		// Check for postgres CompositeType — extract fields
+		typeName := reflect.TypeOf(t).String()
+		if strings.Contains(typeName, "Composite") {
+			// Use reflection to get Fields []*schema.Column
+			val := reflect.ValueOf(t).Elem()
+			fieldsVal := val.FieldByName("Fields")
+			var fields []flatCompositeField
+			if fieldsVal.IsValid() && fieldsVal.Kind() == reflect.Slice {
+				for i := 0; i < fieldsVal.Len(); i++ {
+					col := fieldsVal.Index(i).Interface().(*schema.Column)
+					fields = append(fields, flatCompositeField{
+						Name: col.Name,
+						Type: typeString(col.Type.Type),
+					})
+				}
+			}
+			return "composite", true, nil, fields
+		}
 		// Handle driver-specific types by checking the T field via reflection.
 		// This covers postgres SerialType, ArrayType, NetworkType, CurrencyType, etc.
-		return typeCategoryFromName(typeString(t)), isCustomType(t), nil
+		return typeCategoryFromName(typeString(t)), isCustomType(t), nil, nil
 	}
 }
 

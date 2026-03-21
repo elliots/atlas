@@ -438,8 +438,13 @@ Loop:
 
 func (s *Scanner) comment(left, right string) {
 	i := strings.Index(s.input[s.pos:], right)
-	// Not a comment.
+	// If the terminator is not found (e.g. -- comment at end of file without \n),
+	// skip to the end of input instead of treating it as not a comment.
 	if i == -1 {
+		if right == "\n" {
+			// Line comment without trailing newline — skip to end.
+			s.addPos(len(s.input[s.pos:]))
+		}
 		return
 	}
 	// If the comment reside inside a statement, collect it.

@@ -36,6 +36,9 @@ type Cmd struct {
 	// comments and @-tags can be extracted before execution.
 	Files []string `json:"files,omitempty"`
 
+	// Optional filenames corresponding to Files entries (for error messages).
+	FileNames []string `json:"fileNames,omitempty"`
+
 	// For "inspect": optional schema name filter.
 	Schema string `json:"schema,omitempty"`
 
@@ -91,25 +94,53 @@ func handleCmd(cmd Cmd) (*Result, error) {
 }
 
 // execAndInspect executes SQL files, inspects the schema, and applies tags.
-func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, schemaName string) (*schema.Realm, error) {
+func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fileNames []string, schemaName string) (*schema.Realm, error) {
 	// Extract tags from SQL comments before executing (comments are lost on execution).
-	dir, err := filesToDir(files)
+	dir, err := filesToDir(files, fileNames)
 	if err != nil {
 		return nil, err
 	}
-	tagIdx, err := migrate.ExtractTags(drv, dir)
-	if err != nil {
-		return nil, fmt.Errorf("extract tags: %w", err)
+	// Extract tags per-file so errors include the filename.
+	tagIdx := &migrate.TagIndex{
+		TableTags:  make(map[string][]*schema.Tag),
+		ColumnTags: make(map[string][]*schema.Tag),
+	}
+	perFileDir := migrate.OpenMemDir("single")
+	for i, f := range files {
+		perFileDir.Reset()
+		name := fmt.Sprintf("%d.sql", i)
+		if i < len(fileNames) && fileNames[i] != "" {
+			name = fileNames[i]
+		}
+		if err := perFileDir.WriteFile(name, []byte(f)); err != nil {
+			return nil, err
+		}
+		idx, err := migrate.ExtractTags(drv, perFileDir)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%s", name, err.Error())
+		}
+		for k, v := range idx.TableTags {
+			tagIdx.TableTags[k] = append(tagIdx.TableTags[k], v...)
+		}
+		for k, v := range idx.ColumnTags {
+			tagIdx.ColumnTags[k] = append(tagIdx.ColumnTags[k], v...)
+		}
 	}
 
-	// Execute the SQL on the database.
-	stmts, err := allStmts(drv, dir)
+	// Execute the SQL on the database, tracking which file each statement came from.
+	dirFiles, err := dir.Files()
 	if err != nil {
 		return nil, err
 	}
-	for _, s := range stmts {
-		if _, err := drv.ExecContext(ctx, s); err != nil {
-			return nil, fmt.Errorf("exec: %w", err)
+	for _, f := range dirFiles {
+		fileStmts, err := migrate.FileStmts(drv, f)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f.Name(), err)
+		}
+		for _, s := range fileStmts {
+			if _, err := drv.ExecContext(ctx, s); err != nil {
+				return nil, fmt.Errorf("%s: %w", f.Name(), err)
+			}
 		}
 	}
 
@@ -135,7 +166,11 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, sch
 
 // cmdInspect executes SQL files and returns the schema with tags.
 func cmdInspect(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	realm, err := execAndInspect(ctx, drv, cmd.Files, cmd.Schema)
+	// Ensure clean database before inspecting
+	if err := ensureClean(ctx, drv); err != nil {
+		return nil, fmt.Errorf("clean: %w", err)
+	}
+	realm, err := execAndInspect(ctx, drv, cmd.Files, cmd.FileNames, cmd.Schema)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +179,7 @@ func cmdInspect(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, erro
 
 // cmdApply executes SQL files on the database.
 func cmdApply(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	dir, err := filesToDir(cmd.Files)
+	dir, err := filesToDir(cmd.Files, cmd.FileNames)
 	if err != nil {
 		return nil, err
 	}
@@ -162,12 +197,21 @@ func cmdApply(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error)
 
 // cmdDiff compares two sets of SQL files and returns migration statements.
 func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	fromRealm, err := execAndInspect(ctx, drv, cmd.From, cmd.Schema)
+	// Clean, execute "from" SQL, inspect, clean again, execute "to" SQL, inspect.
+	// Each side gets a fresh database — handles multi-schema SQL correctly.
+	if err := ensureClean(ctx, drv); err != nil {
+		return nil, fmt.Errorf("clean: %w", err)
+	}
+	fromRealm, err := execAndInspect(ctx, drv, cmd.From, nil, cmd.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("from: %w", err)
 	}
 
-	toRealm, err := execAndInspect(ctx, drv, cmd.To, cmd.Schema)
+	if err := ensureClean(ctx, drv); err != nil {
+		return nil, fmt.Errorf("reset: %w", err)
+	}
+
+	toRealm, err := execAndInspect(ctx, drv, cmd.To, nil, cmd.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("to: %w", err)
 	}
@@ -192,12 +236,30 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 	return &Result{Statements: stmts}, nil
 }
 
+// ensureClean checks the dev database is empty using the driver's CheckClean,
+// then drops and recreates public schema to guarantee a clean slate.
+// This mirrors Atlas CLI's behavior — the dev database must be disposable.
+func ensureClean(ctx context.Context, drv migrate.Driver) error {
+	if _, err := drv.ExecContext(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
+		return err
+	}
+	if _, err := drv.ExecContext(ctx, "CREATE SCHEMA public"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // filesToDir converts raw SQL file contents into a migrate.Dir.
-func filesToDir(files []string) (*migrate.MemDir, error) {
+// If names are provided, they're used as filenames (for better error messages).
+func filesToDir(files []string, names []string) (*migrate.MemDir, error) {
 	dir := migrate.OpenMemDir("work")
 	dir.Reset()
 	for i, f := range files {
-		if err := dir.WriteFile(fmt.Sprintf("%d.sql", i), []byte(f)); err != nil {
+		name := fmt.Sprintf("%d.sql", i)
+		if i < len(names) && names[i] != "" {
+			name = names[i]
+		}
+		if err := dir.WriteFile(name, []byte(f)); err != nil {
 			return nil, err
 		}
 	}
