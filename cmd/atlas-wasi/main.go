@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/mysql"
@@ -25,6 +26,23 @@ const (
 	CmdDiff    = "diff"    // Diff two schemas and return migration SQL.
 	CmdApply   = "apply"   // Apply SQL statements to the DB.
 )
+
+// Rename represents a known rename (from @docs.previously tags).
+type Rename struct {
+	Type    string `json:"type"`    // "column" or "table"
+	Table   string `json:"table"`   // table name (for column renames)
+	OldName string `json:"oldName"` // old column/table name
+	NewName string `json:"newName"` // new column/table name
+}
+
+// RenameCandidate is a potential rename detected during diff (drop+add with same type).
+type RenameCandidate struct {
+	Type    string `json:"type"`              // "column" or "table"
+	Table   string `json:"table"`             // table name
+	OldName string `json:"oldName"`           // dropped name
+	NewName string `json:"newName"`           // added name
+	ColType string `json:"colType,omitempty"` // column type (for display)
+}
 
 // Cmd is a command from the host.
 type Cmd struct {
@@ -45,6 +63,17 @@ type Cmd struct {
 	// For "diff": two sets of SQL files to compare.
 	From []string `json:"from,omitempty"`
 	To   []string `json:"to,omitempty"`
+
+	// For "diff": known renames from @docs.previously tags.
+	Renames []Rename `json:"renames,omitempty"`
+}
+
+// Change describes a single structured schema change for CLI rendering.
+type Change struct {
+	Type   string `json:"type"`             // add_table, drop_table, rename_table, add_column, drop_column, rename_column, modify_column, add_index, drop_index, add_view, drop_view, add_function, drop_function
+	Table  string `json:"table"`            // parent table/view name
+	Name   string `json:"name,omitempty"`   // column/index/constraint name (empty for table-level changes)
+	Detail string `json:"detail,omitempty"` // type info for adds, "old -> new" for renames, modification description
 }
 
 // Result is returned to the host.
@@ -54,6 +83,12 @@ type Result struct {
 
 	// For "diff": the migration SQL statements.
 	Statements []string `json:"statements,omitempty"`
+
+	// For "diff": structured change descriptions for pretty rendering.
+	Changes []Change `json:"changes,omitempty"`
+
+	// For "diff": potential renames detected (drop+add pairs with same type).
+	Candidates []RenameCandidate `json:"candidates,omitempty"`
 
 	// Error if the command failed.
 	Error string `json:"error,omitempty"`
@@ -216,24 +251,381 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 		return nil, fmt.Errorf("to: %w", err)
 	}
 
+	// Apply known renames: modify the FROM realm so Atlas sees the objects
+	// with their new names, then emit RENAME statements separately.
+	var renameStmts []string
+	if len(cmd.Renames) > 0 {
+		renameStmts = applyKnownRenames(fromRealm, cmd.Renames, cmd.Dialect)
+	}
+
+	// Detect rename candidates before diffing (drop+add pairs with same type).
+	candidates := detectRenameCandidates(fromRealm, toRealm, cmd.Renames)
+
 	changes, err := drv.RealmDiff(fromRealm, toRealm)
 	if err != nil {
 		return nil, fmt.Errorf("diff: %w", err)
 	}
-	if len(changes) == 0 {
-		return &Result{}, nil
+
+	// Build structured changes from the schema diff + known renames.
+	structured := extractRenameChanges(cmd.Renames)
+	structured = append(structured, extractChanges(changes)...)
+
+	if len(changes) == 0 && len(renameStmts) == 0 {
+		return &Result{Candidates: candidates, Changes: structured}, nil
 	}
 
-	plan, err := drv.PlanChanges(ctx, "migration", changes)
-	if err != nil {
-		return nil, fmt.Errorf("plan: %w", err)
+	var diffStmts []string
+	if len(changes) > 0 {
+		plan, err := drv.PlanChanges(ctx, "migration", changes)
+		if err != nil {
+			return nil, fmt.Errorf("plan: %w", err)
+		}
+		for _, c := range plan.Changes {
+			diffStmts = append(diffStmts, c.Cmd)
+		}
 	}
 
-	stmts := make([]string, len(plan.Changes))
-	for i, c := range plan.Changes {
-		stmts[i] = c.Cmd
+	// Prepend RENAME statements before the diff output.
+	stmts := append(renameStmts, diffStmts...)
+	return &Result{Statements: stmts, Changes: structured, Candidates: candidates}, nil
+}
+
+// extractChanges converts Atlas schema.Change objects into flat Change structs.
+func extractChanges(changes []schema.Change) []Change {
+	var result []Change
+	for _, c := range changes {
+		switch v := c.(type) {
+		case *schema.AddTable:
+			result = append(result, Change{Type: "add_table", Table: v.T.Name})
+		case *schema.DropTable:
+			result = append(result, Change{Type: "drop_table", Table: v.T.Name})
+		case *schema.RenameTable:
+			result = append(result, Change{Type: "rename_table", Table: v.To.Name, Detail: v.From.Name + " -> " + v.To.Name})
+		case *schema.ModifyTable:
+			result = append(result, extractTableChanges(v.T.Name, v.Changes)...)
+		case *schema.AddView:
+			result = append(result, Change{Type: "add_view", Table: v.V.Name})
+		case *schema.DropView:
+			result = append(result, Change{Type: "drop_view", Table: v.V.Name})
+		case *schema.AddFunc:
+			result = append(result, Change{Type: "add_function", Table: v.F.Name})
+		case *schema.DropFunc:
+			result = append(result, Change{Type: "drop_function", Table: v.F.Name})
+		case *schema.ModifySchema:
+			// Schema-level changes may contain nested table/view/func changes
+			result = append(result, extractChanges(v.Changes)...)
+		}
 	}
-	return &Result{Statements: stmts}, nil
+	return result
+}
+
+// extractTableChanges converts sub-changes of a ModifyTable into flat Change structs.
+func extractTableChanges(tableName string, changes []schema.Change) []Change {
+	var result []Change
+	for _, c := range changes {
+		switch v := c.(type) {
+		case *schema.AddColumn:
+			detail := ""
+			if v.C.Type != nil && v.C.Type.Type != nil {
+				detail = typeString(v.C.Type.Type)
+			}
+			result = append(result, Change{Type: "add_column", Table: tableName, Name: v.C.Name, Detail: detail})
+		case *schema.DropColumn:
+			result = append(result, Change{Type: "drop_column", Table: tableName, Name: v.C.Name})
+		case *schema.ModifyColumn:
+			detail := describeColumnModification(v)
+			result = append(result, Change{Type: "modify_column", Table: tableName, Name: v.To.Name, Detail: detail})
+		case *schema.RenameColumn:
+			result = append(result, Change{Type: "rename_column", Table: tableName, Name: v.To.Name, Detail: v.From.Name + " -> " + v.To.Name})
+		case *schema.AddIndex:
+			result = append(result, Change{Type: "add_index", Table: tableName, Name: v.I.Name})
+		case *schema.DropIndex:
+			result = append(result, Change{Type: "drop_index", Table: tableName, Name: v.I.Name})
+		}
+	}
+	return result
+}
+
+// describeColumnModification returns a human-readable description of a column modification.
+func describeColumnModification(m *schema.ModifyColumn) string {
+	var parts []string
+	if m.Change.Is(schema.ChangeType) {
+		from := ""
+		to := ""
+		if m.From.Type != nil && m.From.Type.Type != nil {
+			from = typeString(m.From.Type.Type)
+		}
+		if m.To.Type != nil && m.To.Type.Type != nil {
+			to = typeString(m.To.Type.Type)
+		}
+		if from != "" && to != "" && from != to {
+			parts = append(parts, from+" -> "+to)
+		}
+	}
+	if m.Change.Is(schema.ChangeNull) {
+		if m.To.Type != nil && m.To.Type.Null {
+			parts = append(parts, "set nullable")
+		} else {
+			parts = append(parts, "set not null")
+		}
+	}
+	if m.Change.Is(schema.ChangeDefault) {
+		parts = append(parts, "default changed")
+	}
+	if len(parts) == 0 {
+		return "modified"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// extractRenameChanges converts known renames (from @docs.previously) into Change structs.
+func extractRenameChanges(renames []Rename) []Change {
+	var result []Change
+	for _, r := range renames {
+		switch r.Type {
+		case "column":
+			result = append(result, Change{
+				Type:   "rename_column",
+				Table:  r.Table,
+				Name:   r.NewName,
+				Detail: r.OldName + " -> " + r.NewName,
+			})
+		case "table":
+			result = append(result, Change{
+				Type:   "rename_table",
+				Table:  r.NewName,
+				Detail: r.OldName + " -> " + r.NewName,
+			})
+		}
+	}
+	return result
+}
+
+// applyKnownRenames modifies the FROM realm in-place to reflect known renames.
+// For each rename, it renames the column/table in the FROM realm to its new name
+// (so Atlas sees no drop+add) and returns the corresponding RENAME SQL statements.
+func applyKnownRenames(fromRealm *schema.Realm, renames []Rename, dialect string) []string {
+	var stmts []string
+	for _, r := range renames {
+		switch r.Type {
+		case "column":
+			col := findColumn(fromRealm, r.Table, r.OldName)
+			if col != nil {
+				col.Name = r.NewName
+				stmts = append(stmts, fmtRenameColumn(r.Table, r.OldName, r.NewName, dialect))
+				// Also update any index references to this column
+				tbl := findTable(fromRealm, r.Table)
+				if tbl != nil {
+					for _, idx := range tbl.Indexes {
+						for _, part := range idx.Parts {
+							if part.C != nil && part.C == col {
+								// Column pointer already updated — nothing else needed
+							}
+						}
+					}
+				}
+			}
+		case "table":
+			tbl := findTable(fromRealm, r.OldName)
+			if tbl != nil {
+				tbl.Name = r.NewName
+				stmts = append(stmts, fmtRenameTable(r.OldName, r.NewName, dialect))
+			}
+		}
+	}
+	return stmts
+}
+
+// detectRenameCandidates compares FROM and TO realms to find potential renames.
+// A candidate is a dropped column + added column on the same table with the same type,
+// not already covered by a known rename.
+func detectRenameCandidates(fromRealm, toRealm *schema.Realm, knownRenames []Rename) []RenameCandidate {
+	// Build set of known renames for quick lookup
+	knownSet := make(map[string]bool)
+	for _, r := range knownRenames {
+		if r.Type == "column" {
+			knownSet[r.Table+"."+r.OldName+"->"+r.NewName] = true
+		} else {
+			knownSet[r.OldName+"->"+r.NewName] = true
+		}
+	}
+
+	var candidates []RenameCandidate
+
+	// Compare tables across schemas
+	for _, fromSchema := range fromRealm.Schemas {
+		toSchema := findSchema(toRealm, fromSchema.Name)
+		if toSchema == nil {
+			continue
+		}
+
+		// ── Column rename candidates ──
+		for _, fromTable := range fromSchema.Tables {
+			toTable := findTableInSchema(toSchema, fromTable.Name)
+			if toTable == nil {
+				continue
+			}
+
+			// Find columns in FROM that are missing in TO (dropped)
+			var droppedCols []*schema.Column
+			for _, fc := range fromTable.Columns {
+				if findColumnInTable(toTable, fc.Name) == nil {
+					droppedCols = append(droppedCols, fc)
+				}
+			}
+
+			// Find columns in TO that are missing in FROM (added)
+			var addedCols []*schema.Column
+			for _, tc := range toTable.Columns {
+				if findColumnInTable(fromTable, tc.Name) == nil {
+					addedCols = append(addedCols, tc)
+				}
+			}
+
+			// Match dropped+added pairs with same type
+			usedDropped := make(map[int]bool)
+			usedAdded := make(map[int]bool)
+
+			for di, dc := range droppedCols {
+				for ai, ac := range addedCols {
+					if usedDropped[di] || usedAdded[ai] {
+						continue
+					}
+					if typesMatch(dc, ac) {
+						key := fromTable.Name + "." + dc.Name + "->" + ac.Name
+						if knownSet[key] {
+							continue
+						}
+						candidates = append(candidates, RenameCandidate{
+							Type:    "column",
+							Table:   fromTable.Name,
+							OldName: dc.Name,
+							NewName: ac.Name,
+							ColType: typeString(dc.Type.Type),
+						})
+						usedDropped[di] = true
+						usedAdded[ai] = true
+					}
+				}
+			}
+		}
+
+		// ── Table rename candidates ──
+		// Find tables in FROM missing from TO (dropped)
+		var droppedTables []*schema.Table
+		for _, ft := range fromSchema.Tables {
+			if findTableInSchema(toSchema, ft.Name) == nil {
+				droppedTables = append(droppedTables, ft)
+			}
+		}
+
+		// Find tables in TO missing from FROM (added)
+		var addedTables []*schema.Table
+		for _, tt := range toSchema.Tables {
+			if findTableInSchema(fromSchema, tt.Name) == nil {
+				addedTables = append(addedTables, tt)
+			}
+		}
+
+		// Only suggest table renames when there's exactly one drop and one add
+		// (otherwise it's ambiguous which table maps to which).
+		if len(droppedTables) == 1 && len(addedTables) == 1 {
+			dt := droppedTables[0]
+			at := addedTables[0]
+			key := dt.Name + "->" + at.Name
+			if !knownSet[key] {
+				candidates = append(candidates, RenameCandidate{
+					Type:    "table",
+					Table:   dt.Name,
+					OldName: dt.Name,
+					NewName: at.Name,
+				})
+			}
+		}
+	}
+
+	return candidates
+}
+
+// ── Realm lookup helpers ────────────────────────────────────────────────
+
+func findSchema(realm *schema.Realm, name string) *schema.Schema {
+	for _, s := range realm.Schemas {
+		if s.Name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func findTable(realm *schema.Realm, name string) *schema.Table {
+	for _, s := range realm.Schemas {
+		for _, t := range s.Tables {
+			if t.Name == name {
+				return t
+			}
+		}
+	}
+	return nil
+}
+
+func findTableInSchema(s *schema.Schema, name string) *schema.Table {
+	for _, t := range s.Tables {
+		if t.Name == name {
+			return t
+		}
+	}
+	return nil
+}
+
+func findColumn(realm *schema.Realm, tableName, colName string) *schema.Column {
+	t := findTable(realm, tableName)
+	if t == nil {
+		return nil
+	}
+	return findColumnInTable(t, colName)
+}
+
+func findColumnInTable(t *schema.Table, name string) *schema.Column {
+	for _, c := range t.Columns {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// typesMatch checks if two columns have the same type for rename candidate detection.
+func typesMatch(a, b *schema.Column) bool {
+	if a.Type == nil || b.Type == nil {
+		return false
+	}
+	if a.Type.Type == nil || b.Type.Type == nil {
+		return false
+	}
+	return typeString(a.Type.Type) == typeString(b.Type.Type)
+}
+
+// fmtRenameColumn returns a dialect-appropriate RENAME COLUMN statement.
+func fmtRenameColumn(table, oldCol, newCol, dialect string) string {
+	q := quoteIdent(dialect)
+	return fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", q(table), q(oldCol), q(newCol))
+}
+
+// fmtRenameTable returns a dialect-appropriate RENAME TABLE statement.
+func fmtRenameTable(oldTable, newTable, dialect string) string {
+	q := quoteIdent(dialect)
+	return fmt.Sprintf("ALTER TABLE %s RENAME TO %s", q(oldTable), q(newTable))
+}
+
+// quoteIdent returns a function that quotes an identifier for the given dialect.
+func quoteIdent(dialect string) func(string) string {
+	switch dialect {
+	case "mysql":
+		return func(s string) string { return "`" + s + "`" }
+	default: // postgres, sqlite
+		return func(s string) string { return `"` + s + `"` }
+	}
 }
 
 // ensureClean checks the dev database is empty using the driver's CheckClean,

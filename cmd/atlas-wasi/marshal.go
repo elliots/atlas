@@ -16,9 +16,11 @@ import (
 // that cause cycles in json.Marshal. These flat types omit them.
 
 type flatResult struct {
-	Schema     *flatRealm `json:"schema,omitempty"`
-	Statements []string   `json:"statements,omitempty"`
-	Error      string     `json:"error,omitempty"`
+	Schema     *flatRealm        `json:"schema,omitempty"`
+	Statements []string          `json:"statements,omitempty"`
+	Changes    []Change          `json:"changes,omitempty"`
+	Candidates []RenameCandidate `json:"candidates,omitempty"`
+	Error      string            `json:"error,omitempty"`
 }
 
 type flatRealm struct {
@@ -126,6 +128,8 @@ type flatTrigger struct {
 func flattenResult(r *Result) *flatResult {
 	fr := &flatResult{
 		Statements: r.Statements,
+		Changes:    r.Changes,
+		Candidates: r.Candidates,
 		Error:      r.Error,
 	}
 	if r.Schema != nil {
