@@ -19,7 +19,7 @@ type flatResult struct {
 	Schema     *flatRealm        `json:"schema,omitempty"`
 	Statements []string          `json:"statements,omitempty"`
 	Changes    []Change          `json:"changes,omitempty"`
-	Candidates []RenameCandidate `json:"candidates,omitempty"`
+	RenameCandidates []RenameCandidate `json:"renameCandidates,omitempty"`
 	Error      string            `json:"error,omitempty"`
 }
 
@@ -129,7 +129,7 @@ func flattenResult(r *Result) *flatResult {
 	fr := &flatResult{
 		Statements: r.Statements,
 		Changes:    r.Changes,
-		Candidates: r.Candidates,
+		RenameCandidates: r.RenameCandidates,
 		Error:      r.Error,
 	}
 	if r.Schema != nil {

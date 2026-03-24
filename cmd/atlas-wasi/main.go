@@ -88,7 +88,7 @@ type Result struct {
 	Changes []Change `json:"changes,omitempty"`
 
 	// For "diff": potential renames detected (drop+add pairs with same type).
-	Candidates []RenameCandidate `json:"candidates,omitempty"`
+	RenameCandidates []RenameCandidate `json:"renameCandidates,omitempty"`
 
 	// Error if the command failed.
 	Error string `json:"error,omitempty"`
@@ -201,10 +201,17 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 
 // cmdInspect executes SQL files and returns the schema with tags.
 func cmdInspect(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	// Ensure clean database before inspecting
-	if err := ensureClean(ctx, drv); err != nil {
-		return nil, fmt.Errorf("clean: %w", err)
+	// Snapshot verifies the database is empty (returns NotCleanError if not)
+	// and provides a restore function to clean up after.
+	sn, ok := drv.(migrate.Snapshoter)
+	if !ok {
+		return nil, fmt.Errorf("driver does not implement Snapshoter")
 	}
+	restore, err := sn.Snapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+	defer restore(ctx) //nolint
 	realm, err := execAndInspect(ctx, drv, cmd.Files, cmd.FileNames, cmd.Schema)
 	if err != nil {
 		return nil, err
@@ -232,18 +239,25 @@ func cmdApply(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error)
 
 // cmdDiff compares two sets of SQL files and returns migration statements.
 func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	// Clean, execute "from" SQL, inspect, clean again, execute "to" SQL, inspect.
-	// Each side gets a fresh database — handles multi-schema SQL correctly.
-	if err := ensureClean(ctx, drv); err != nil {
-		return nil, fmt.Errorf("clean: %w", err)
+	// Snapshot verifies the database is empty and provides a restore function
+	// to reset between the two diff passes.
+	sn, ok := drv.(migrate.Snapshoter)
+	if !ok {
+		return nil, fmt.Errorf("driver does not implement Snapshoter")
 	}
+	restore, err := sn.Snapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+	defer restore(ctx) //nolint
 	fromRealm, err := execAndInspect(ctx, drv, cmd.From, nil, cmd.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("from: %w", err)
 	}
 
-	if err := ensureClean(ctx, drv); err != nil {
-		return nil, fmt.Errorf("reset: %w", err)
+	// Restore to empty state before the "to" pass.
+	if err := restore(ctx); err != nil {
+		return nil, fmt.Errorf("restore: %w", err)
 	}
 
 	toRealm, err := execAndInspect(ctx, drv, cmd.To, nil, cmd.Schema)
@@ -271,7 +285,7 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 	structured = append(structured, extractChanges(changes)...)
 
 	if len(changes) == 0 && len(renameStmts) == 0 {
-		return &Result{Candidates: candidates, Changes: structured}, nil
+		return &Result{RenameCandidates: candidates, Changes: structured}, nil
 	}
 
 	var diffStmts []string
@@ -287,7 +301,7 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 
 	// Prepend RENAME statements before the diff output.
 	stmts := append(renameStmts, diffStmts...)
-	return &Result{Statements: stmts, Changes: structured, Candidates: candidates}, nil
+	return &Result{Statements: stmts, Changes: structured, RenameCandidates: candidates}, nil
 }
 
 // extractChanges converts Atlas schema.Change objects into flat Change structs.
@@ -406,10 +420,28 @@ func extractRenameChanges(renames []Rename) []Change {
 // (so Atlas sees no drop+add) and returns the corresponding RENAME SQL statements.
 func applyKnownRenames(fromRealm *schema.Realm, renames []Rename, dialect string) []string {
 	var stmts []string
+	// Build table rename map (newName -> oldName) so column renames
+	// can look up the old table name when the table was also renamed.
+	tableRenameMap := make(map[string]string)
+	for _, r := range renames {
+		if r.Type == "table" {
+			tableRenameMap[r.NewName] = r.OldName
+		}
+	}
+
 	for _, r := range renames {
 		switch r.Type {
 		case "column":
-			col := findColumn(fromRealm, r.Table, r.OldName)
+			// Try the table name as-is first, then try the old table name
+			// (if the table itself was renamed)
+			tableName := r.Table
+			col := findColumn(fromRealm, tableName, r.OldName)
+			if col == nil {
+				if oldTable, ok := tableRenameMap[tableName]; ok {
+					tableName = oldTable
+					col = findColumn(fromRealm, tableName, r.OldName)
+				}
+			}
 			if col != nil {
 				col.Name = r.NewName
 				stmts = append(stmts, fmtRenameColumn(r.Table, r.OldName, r.NewName, dialect))
@@ -626,19 +658,6 @@ func quoteIdent(dialect string) func(string) string {
 	default: // postgres, sqlite
 		return func(s string) string { return `"` + s + `"` }
 	}
-}
-
-// ensureClean checks the dev database is empty using the driver's CheckClean,
-// then drops and recreates public schema to guarantee a clean slate.
-// This mirrors Atlas CLI's behavior — the dev database must be disposable.
-func ensureClean(ctx context.Context, drv migrate.Driver) error {
-	if _, err := drv.ExecContext(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		return err
-	}
-	if _, err := drv.ExecContext(ctx, "CREATE SCHEMA public"); err != nil {
-		return err
-	}
-	return nil
 }
 
 // filesToDir converts raw SQL file contents into a migrate.Dir.

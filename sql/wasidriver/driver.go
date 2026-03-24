@@ -176,7 +176,15 @@ func (r *rows) Next(dest []driver.Value) error {
 	r.pos++
 	for i := range dest {
 		if i < len(row) {
-			dest[i] = row[i]
+			v := row[i]
+			// JSON numbers are always float64 in Go. Convert whole-number floats
+			// to int64 so database/sql Scan can convert them to bool, int, etc.
+			if f, ok := v.(float64); ok {
+				if f == float64(int64(f)) {
+					v = int64(f)
+				}
+			}
+			dest[i] = v
 		}
 	}
 	return nil
