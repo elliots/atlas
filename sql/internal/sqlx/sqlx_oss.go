@@ -121,17 +121,24 @@ func (*Diff) triggerDiff(from, to interface {
 }
 
 // funcDep returns true if f1 depends on f2.
-func funcDep(_, _ *schema.Func, _ SortOptions) bool {
-	return false // unimplemented.
+func funcDep(f1, f2 *schema.Func, _ SortOptions) bool {
+	return slices.Contains(f1.Deps, schema.Object(f2))
 }
 
 // procDep returns true if p1 depends on p2.
-func procDep(_, _ *schema.Proc, _ SortOptions) bool {
-	return false // unimplemented.
+func procDep(p1 *schema.Proc, p2 *schema.Proc, _ SortOptions) bool {
+	return slices.Contains(p1.Deps, schema.Object(p2))
 }
 
-func tableDepFunc(*schema.Table, *schema.Func, SortOptions) bool {
-	return false // unimplemented.
+// tableDepFunc returns true if the table depends on the function
+// (e.g., a trigger on the table references the function).
+func tableDepFunc(t *schema.Table, f *schema.Func, _ SortOptions) bool {
+	for _, tg := range t.Triggers {
+		if slices.Contains(tg.Deps, schema.Object(f)) {
+			return true
+		}
+	}
+	return false
 }
 
 // askForColumns detects column renames by matching DropColumn+AddColumn pairs
@@ -460,6 +467,11 @@ func dependsOn(c1, c2 schema.Change, _ SortOptions) bool {
 		return depOfAdd(c1.T.Deps, c2)
 	case *schema.DropTrigger:
 		return depOfDrop(c1.T, c2)
+	case *schema.AddObject:
+		// An AddObject may have Deps (e.g., aggregate depends on its state function).
+		if d, ok := c1.O.(interface{ DepsOf() []schema.Object }); ok {
+			return depOfAdd(d.DepsOf(), c2)
+		}
 	case *schema.DropObject:
 		t, ok := c1.O.(schema.Type)
 		if !ok {

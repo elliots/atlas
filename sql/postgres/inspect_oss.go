@@ -64,6 +64,7 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 				return nil, err
 			}
 			sqlx.LinkSchemaTables(schemas)
+			resolveColumnTypes(r)
 		}
 		if mode.Is(schema.InspectViews) {
 			if err := i.inspectViews(ctx, r, nil); err != nil {
@@ -166,6 +167,7 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 			return nil, err
 		}
 		sqlx.LinkSchemaTables(schemas)
+		resolveColumnTypes(r)
 	}
 	if mode.Is(schema.InspectViews) {
 		if err := i.inspectViews(ctx, r, opts); err != nil {
@@ -443,6 +445,53 @@ func (i *inspect) underlyingType(s *schema.Schema, u *UserDefinedType) schema.Ty
 	}
 	// No match.
 	return u
+}
+
+// resolveColumnTypes links UserDefinedType columns to actual schema objects
+// (EnumType, DomainType) that were inspected separately. This enables the
+// dependency sorter to correctly order type creation before table creation.
+func resolveColumnTypes(r *schema.Realm) {
+	for _, s := range r.Schemas {
+		// Build lookup of enum/domain names → objects.
+		enums := make(map[string]*schema.EnumType)
+		domains := make(map[string]*DomainType)
+		for _, o := range s.Objects {
+			switch v := o.(type) {
+			case *schema.EnumType:
+				enums[v.T] = v
+				if s.Name != "" {
+					enums[s.Name+"."+v.T] = v
+				}
+			case *DomainType:
+				domains[v.T] = v
+				if s.Name != "" {
+					domains[s.Name+"."+v.T] = v
+				}
+			}
+		}
+		// Resolve column types.
+		for _, t := range s.Tables {
+			for _, c := range t.Columns {
+				if c.Type == nil || c.Type.Type == nil {
+					continue
+				}
+				u, ok := c.Type.Type.(*UserDefinedType)
+				if !ok {
+					continue
+				}
+				switch u.C {
+				case "e": // enum
+					if e, ok := enums[u.T]; ok {
+						c.Type.Type = e
+					}
+				case "d": // domain
+					if d, ok := domains[u.T]; ok {
+						c.Type.Type = d
+					}
+				}
+			}
+		}
+	}
 }
 
 // enumValues fills enum columns with their values from the database.
@@ -858,27 +907,11 @@ func nArgs(start, n int) string {
 	return b.String()
 }
 
-// A regexp to extracts the sequence name from a "nextval" expression.
-// nextval('<optional (quoted) schema>.<sequence name>'::regclass).
-var reNextval = regexp.MustCompile(`(?i) *nextval\('(?:"?[\w$]+"?\.)?"?([\w$]+_[\w$]+_seq)"?'(?:::regclass)*\) *$`)
-
 func columnDefault(c *schema.Column, s string) {
-	switch m := reNextval.FindStringSubmatch(s); {
-	// The definition of "<column> <serial type>" is equivalent to specifying:
-	// "<column> <int type> NOT NULL DEFAULT nextval('<table>_<column>_seq')".
-	// https://postgresql.org/docs/current/datatype-numeric.html#DATATYPE-SERIAL.
-	case len(m) == 2:
-		tt, ok := c.Type.Type.(*schema.IntegerType)
-		if !ok {
-			return
-		}
-		st := &SerialType{SequenceName: m[1]}
-		st.SetType(tt)
-		c.Type.Raw = st.T
-		c.Type.Type = st
-	default:
-		c.Default = defaultExpr(c.Type.Type, s)
-	}
+	// Note: we do NOT convert nextval() defaults to SerialType here.
+	// Serial conversion is done later in inspectObjects, only when
+	// the sequence is confirmed to be auto-owned (deptype='a').
+	c.Default = defaultExpr(c.Type.Type, s)
 }
 
 func defaultExpr(t schema.Type, s string) schema.Expr {
@@ -1179,6 +1212,23 @@ type (
 		Deps    []schema.Object
 	}
 
+	// Aggregate defines a PostgreSQL aggregate function.
+	// https://www.postgresql.org/docs/current/sql-createaggregate.html
+	Aggregate struct {
+		schema.Object
+		Name         string         // Aggregate name.
+		Schema       *schema.Schema // Schema the aggregate belongs to.
+		Args         []*schema.FuncArg // Argument types.
+		StateFunc    string         // State transition function name.
+		StateType    schema.Type    // State data type.
+		FinalFunc    string         // Final calculation function (optional).
+		InitVal      string         // Initial value of the state (optional).
+		SortOp       string         // Sort operator for min/max aggregates (optional).
+		Parallel     string         // Parallel mode: SAFE, UNSAFE, RESTRICTED (optional).
+		Attrs        []schema.Attr
+		Deps         []schema.Object
+	}
+
 	// RangeObj defines a range type as a schema object.
 	RangeObj struct {
 		schema.Type
@@ -1373,6 +1423,12 @@ func (c *CollationObj) SpecType() string {
 // SpecName returns the name of the collation object.
 func (c *CollationObj) SpecName() string {
 	return c.T
+}
+
+// DepsOf returns the dependencies of this aggregate (implements the interface
+// used by the topological sort for AddObject ordering).
+func (a *Aggregate) DepsOf() []schema.Object {
+	return a.Deps
 }
 
 // SpecType returns the HCL block type for a range object.

@@ -162,15 +162,26 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 		}
 	}
 
-	// Execute each file as a single batch to preserve SET session state
-	// and handle pg_dump output with forward references.
-	for i, f := range files {
-		name := fmt.Sprintf("%d.sql", i)
-		if i < len(fileNames) && fileNames[i] != "" {
-			name = fileNames[i]
+	// Execute SQL statements one by one using FileStmts for correct splitting
+	// (handles dollar-quoted function bodies, multi-line strings, etc.)
+	// Session state (SET check_function_bodies, etc.) persists across statements.
+	dir, err := filesToDir(files, fileNames)
+	if err != nil {
+		return nil, err
+	}
+	dirFiles, err := dir.Files()
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range dirFiles {
+		fileStmts, err := migrate.FileStmts(drv, f)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f.Name(), err)
 		}
-		if _, err := drv.ExecContext(ctx, f); err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
+		for _, s := range fileStmts {
+			if _, err := drv.ExecContext(ctx, s); err != nil {
+				return nil, fmt.Errorf("%s: %w", f.Name(), err)
+			}
 		}
 	}
 

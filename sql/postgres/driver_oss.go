@@ -1605,13 +1605,15 @@ func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, opts *sch
 		if err := rows.Scan(&ns, &name, &seqType, &start, &increment, &cache, &minV, &maxV, &cycle, &ownerTable, &ownerColumn); err != nil {
 			return fmt.Errorf("postgres: scanning sequence: %w", err)
 		}
-		// Skip sequences owned by columns (serial/identity); those are managed by the column.
-		if ownerTable.Valid && ownerColumn.Valid {
-			continue
-		}
 		s, ok := r.Schema(ns)
 		if !ok {
 			return fmt.Errorf("postgres: schema %q for sequence %q not found", ns, name)
+		}
+		// Auto-owned sequences (serial/identity) are managed by the column.
+		// Convert the column to SerialType and skip the sequence.
+		if ownerTable.Valid && ownerColumn.Valid {
+			convertToSerial(s, ownerTable.String, ownerColumn.String, name)
+			continue
 		}
 		typ, err := ParseType(seqType)
 		if err != nil {
@@ -1635,6 +1637,18 @@ func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, opts *sch
 			seq.Max = &v
 		}
 		s.Objects = append(s.Objects, seq)
+		// Add sequence as a dependency of the table that uses it via nextval() default.
+		// This ensures the topological sort creates the sequence before the table.
+		for _, t := range s.Tables {
+			for _, c := range t.Columns {
+				if c.Default == nil {
+					continue
+				}
+				if raw, ok := c.Default.(*schema.RawExpr); ok && strings.Contains(raw.X, name) {
+					t.Deps = append(t.Deps, seq)
+				}
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -1642,7 +1656,10 @@ func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, opts *sch
 	if err := i.inspectCollations(ctx, r, opts); err != nil {
 		return err
 	}
-	return i.inspectRangeTypes(ctx, r, opts)
+	if err := i.inspectRangeTypes(ctx, r, opts); err != nil {
+		return err
+	}
+	return i.inspectAggregates(ctx, r, opts)
 }
 
 // inspectCollations queries pg_collation for user-defined collations and attaches them to schemas.
@@ -1721,6 +1738,83 @@ func (i *inspect) inspectRangeTypes(ctx context.Context, r *schema.Realm, _ *sch
 			MultirangeName: multirangeName,
 		}
 		s.Objects = append(s.Objects, ro)
+	}
+	return rows.Err()
+}
+
+// inspectAggregates queries pg_aggregate for user-defined aggregates and attaches them to schemas.
+func (i *inspect) inspectAggregates(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(aggregatesQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying aggregates: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			ns, name, stateFunc, stateType string
+			finalFunc, initVal, sortOp     sql.NullString
+			parallel                       sql.NullString
+			argTypes                       string
+		)
+		if err := rows.Scan(&ns, &name, &stateFunc, &stateType, &finalFunc, &initVal, &sortOp, &parallel, &argTypes); err != nil {
+			return fmt.Errorf("postgres: scanning aggregate: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for aggregate %q not found", ns, name)
+		}
+		st, err := ParseType(stateType)
+		if err != nil {
+			st = &schema.UnsupportedType{T: stateType}
+		}
+		agg := &Aggregate{
+			Name:      name,
+			Schema:    s,
+			StateFunc: stateFunc,
+			StateType: st,
+		}
+		if finalFunc.Valid && finalFunc.String != "-" {
+			agg.FinalFunc = finalFunc.String
+		}
+		if initVal.Valid {
+			agg.InitVal = initVal.String
+		}
+		if sortOp.Valid && sortOp.String != "0" {
+			agg.SortOp = sortOp.String
+		}
+		if parallel.Valid {
+			agg.Parallel = parallel.String
+		}
+		// Parse argument types.
+		if argTypes != "" {
+			for _, a := range strings.Split(argTypes, ", ") {
+				a = strings.TrimSpace(a)
+				if a == "" {
+					continue
+				}
+				at, err := ParseType(a)
+				if err != nil {
+					at = &schema.UnsupportedType{T: a}
+				}
+				agg.Args = append(agg.Args, &schema.FuncArg{
+					Type: at,
+				})
+			}
+		}
+		// Set dependencies on the state/final functions.
+		for _, f := range s.Funcs {
+			if f.Name == agg.StateFunc || (agg.FinalFunc != "" && f.Name == agg.FinalFunc) {
+				agg.Deps = append(agg.Deps, f)
+			}
+		}
+		s.Objects = append(s.Objects, agg)
 	}
 	return rows.Err()
 }
@@ -1815,8 +1909,200 @@ func (i *inspect) inspectTriggers(ctx context.Context, r *schema.Realm, opts *sc
 	return rows.Err()
 }
 
-func (*inspect) inspectDeps(context.Context, *schema.Realm, *schema.InspectOptions) error {
-	return nil // unimplemented.
+// inspectDeps populates Deps fields on functions, procedures, views and triggers
+// by querying pg_depend for actual catalog-tracked dependencies between objects.
+func (i *inspect) inspectDeps(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	// Build lookup maps: pg_class OID name → schema object.
+	type objKey struct {
+		schema, name string
+	}
+	tables := make(map[objKey]*schema.Table)
+	views := make(map[objKey]*schema.View)
+	funcs := make(map[objKey]*schema.Func)
+	procs := make(map[objKey]*schema.Proc)
+	enums := make(map[objKey]*schema.EnumType)
+	domains := make(map[objKey]*DomainType)
+	composites := make(map[objKey]*CompositeType)
+	for _, s := range r.Schemas {
+		for _, t := range s.Tables {
+			tables[objKey{s.Name, t.Name}] = t
+		}
+		for _, v := range s.Views {
+			views[objKey{s.Name, v.Name}] = v
+		}
+		for _, f := range s.Funcs {
+			funcs[objKey{s.Name, f.Name}] = f
+		}
+		for _, p := range s.Procs {
+			procs[objKey{s.Name, p.Name}] = p
+		}
+		for _, o := range s.Objects {
+			switch v := o.(type) {
+			case *schema.EnumType:
+				enums[objKey{s.Name, v.T}] = v
+			case *DomainType:
+				domains[objKey{s.Name, v.T}] = v
+			case *CompositeType:
+				composites[objKey{s.Name, v.T}] = v
+			}
+		}
+	}
+
+	// resolve returns the schema object for a given (schema, name, kind) triple.
+	resolve := func(ns, name, kind string) schema.Object {
+		key := objKey{ns, name}
+		switch kind {
+		case "table":
+			if t, ok := tables[key]; ok {
+				return t
+			}
+		case "view", "matview":
+			if v, ok := views[key]; ok {
+				return v
+			}
+		case "function":
+			if f, ok := funcs[key]; ok {
+				return f
+			}
+		case "procedure":
+			if p, ok := procs[key]; ok {
+				return p
+			}
+		case "enum":
+			if e, ok := enums[key]; ok {
+				return e
+			}
+		case "domain":
+			if d, ok := domains[key]; ok {
+				return d
+			}
+		case "composite":
+			if c, ok := composites[key]; ok {
+				return c
+			}
+			// Every table has an implicit composite type with the same name.
+			// pg_depend reports these as "composite" kind, so fall through to tables.
+			if t, ok := tables[key]; ok {
+				return t
+			}
+		}
+		return nil
+	}
+
+	// Query pg_depend to find dependencies between functions/views and other objects.
+	rows, err := i.QueryContext(ctx, depsQuery)
+	if err != nil {
+		return fmt.Errorf("postgres: querying dependencies: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var srcSchema, srcName, srcKind, depSchema, depName, depKind string
+		if err := rows.Scan(&srcSchema, &srcName, &srcKind, &depSchema, &depName, &depKind); err != nil {
+			return fmt.Errorf("postgres: scanning dependency: %w", err)
+		}
+		dep := resolve(depSchema, depName, depKind)
+		if dep == nil {
+			continue
+		}
+		key := objKey{srcSchema, srcName}
+		switch srcKind {
+		case "function":
+			if f, ok := funcs[key]; ok {
+				f.Deps = append(f.Deps, dep)
+			}
+		case "procedure":
+			if p, ok := procs[key]; ok {
+				p.Deps = append(p.Deps, dep)
+			}
+		case "view", "matview":
+			if v, ok := views[key]; ok {
+				v.Deps = append(v.Deps, dep)
+			}
+		case "table":
+			if t, ok := tables[key]; ok {
+				t.Deps = append(t.Deps, dep)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// pg_depend doesn't track runtime references in function/procedure bodies
+	// (e.g., SELECT FROM table_name in SQL functions). Use word-boundary matching
+	// on function bodies to catch these.
+	for _, s := range r.Schemas {
+		for _, f := range s.Funcs {
+			bodyWords := tokenize(f.Body)
+			for _, t := range s.Tables {
+				if bodyWords[strings.ToLower(t.Name)] && !sliceContains(f.Deps, t) {
+					f.Deps = append(f.Deps, t)
+				}
+			}
+			for _, f2 := range s.Funcs {
+				if f2 != f && bodyWords[strings.ToLower(f2.Name)] && !sliceContains(f.Deps, f2) {
+					f.Deps = append(f.Deps, f2)
+				}
+			}
+		}
+		for _, p := range s.Procs {
+			bodyWords := tokenize(p.Body)
+			for _, t := range s.Tables {
+				if bodyWords[strings.ToLower(t.Name)] && !sliceContains(p.Deps, t) {
+					p.Deps = append(p.Deps, t)
+				}
+			}
+		}
+		// Views: pg_depend tracks view deps at the pg_rewrite level, not on the
+		// view's pg_class entry. Analyze the view definition for table/func/view refs.
+		for _, v := range s.Views {
+			defWords := tokenize(v.Def)
+			for _, t := range s.Tables {
+				if defWords[strings.ToLower(t.Name)] && !sliceContains(v.Deps, t) {
+					v.Deps = append(v.Deps, t)
+				}
+			}
+			for _, f := range s.Funcs {
+				if defWords[strings.ToLower(f.Name)] && !sliceContains(v.Deps, f) {
+					v.Deps = append(v.Deps, f)
+				}
+			}
+			for _, v2 := range s.Views {
+				if v2 != v && defWords[strings.ToLower(v2.Name)] && !sliceContains(v.Deps, v2) {
+					v.Deps = append(v.Deps, v2)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// tokenize splits a function body into lowercase word tokens for dependency matching.
+func tokenize(body string) map[string]bool {
+	words := make(map[string]bool)
+	var buf strings.Builder
+	for _, r := range strings.ToLower(body) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
+			buf.WriteRune(r)
+		} else {
+			if buf.Len() > 0 {
+				words[buf.String()] = true
+				buf.Reset()
+			}
+		}
+	}
+	if buf.Len() > 0 {
+		words[buf.String()] = true
+	}
+	return words
+}
+
+func sliceContains(deps []schema.Object, obj schema.Object) bool {
+	for _, d := range deps {
+		if d == obj {
+			return true
+		}
+	}
+	return false
 }
 
 // inspectRealmObjects queries pg_extension for installed extensions and pg_event_trigger for event triggers.
@@ -2207,17 +2493,34 @@ func (s *state) addObject(add *schema.AddObject) error {
 			Reverse: drop,
 			Comment: fmt.Sprintf("create role %q", o.Name),
 		})
+	case *Cast:
+		create, drop := s.createDropCast(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create cast (%s AS %s)", o.Source, o.Target),
+		})
+	case *Aggregate:
+		create, drop := s.createDropAggregate(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create aggregate %q", o.Name),
+		})
 	}
 	return nil
 }
 
 func (s *state) dropObject(drop *schema.DropObject) error {
+	cascade := sqlx.Has(drop.Extra, &Cascade{})
 	switch o := drop.O.(type) {
 	case *schema.EnumType:
 		create, dropE := s.createDropEnum(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropE,
+			Cmd:     withCascadeStr(dropE, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop enum type %q", o.T),
 		})
@@ -2225,7 +2528,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropS := s.createDropSequence(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropS,
+			Cmd:     withCascadeStr(dropS, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop sequence %q", o.Name),
 		})
@@ -2233,7 +2536,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropD := s.createDropDomain(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropD,
+			Cmd:     withCascadeStr(dropD, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop domain type %q", o.T),
 		})
@@ -2241,7 +2544,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropC := s.createDropComposite(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropC,
+			Cmd:     withCascadeStr(dropC, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop composite type %q", o.T),
 		})
@@ -2249,7 +2552,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropCo := s.createDropCollation(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropCo,
+			Cmd:     withCascadeStr(dropCo, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop collation %q", o.T),
 		})
@@ -2257,14 +2560,15 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropR := s.createDropRange(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropR,
+			Cmd:     withCascadeStr(dropR, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop range type %q", o.T),
 		})
 	case *Extension:
+		cmd := fmt.Sprintf("DROP EXTENSION IF EXISTS %q", o.T)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     fmt.Sprintf("DROP EXTENSION IF EXISTS %q", o.T),
+			Cmd:     withCascadeStr(cmd, cascade),
 			Reverse: fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", o.T),
 			Comment: fmt.Sprintf("drop extension %q", o.T),
 		})
@@ -2272,7 +2576,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropP := s.createDropPolicy(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropP,
+			Cmd:     withCascadeStr(dropP, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop policy %q on table %q", o.Name, o.Table.Name),
 		})
@@ -2280,7 +2584,7 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropET := s.createDropEventTrigger(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropET,
+			Cmd:     withCascadeStr(dropET, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop event trigger %q", o.Name),
 		})
@@ -2288,12 +2592,36 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 		create, dropR := s.createDropRole(o)
 		s.append(&migrate.Change{
 			Source:  drop,
-			Cmd:     dropR,
+			Cmd:     withCascadeStr(dropR, cascade),
 			Reverse: create,
 			Comment: fmt.Sprintf("drop role %q", o.Name),
 		})
+	case *Cast:
+		create, dropC := s.createDropCast(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     withCascadeStr(dropC, cascade),
+			Reverse: create,
+			Comment: fmt.Sprintf("drop cast (%s AS %s)", o.Source, o.Target),
+		})
+	case *Aggregate:
+		create, dropA := s.createDropAggregate(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     withCascadeStr(dropA, cascade),
+			Reverse: create,
+			Comment: fmt.Sprintf("drop aggregate %q", o.Name),
+		})
 	}
 	return nil
+}
+
+// withCascadeStr appends " CASCADE" to a SQL statement if cascade is true.
+func withCascadeStr(stmt string, cascade bool) string {
+	if cascade {
+		return stmt + " CASCADE"
+	}
+	return stmt
 }
 
 func (s *state) modifyObject(modify *schema.ModifyObject) error {
@@ -2335,6 +2663,29 @@ func (s *state) modifyObject(modify *schema.ModifyObject) error {
 		return nil
 	}
 	return nil
+}
+
+// convertToSerial finds the column on the given table that uses nextval() for the
+// given sequence, and converts it from integer + DEFAULT nextval() to SerialType.
+// This is only called for auto-owned sequences (deptype='a' in pg_depend).
+func convertToSerial(s *schema.Schema, tableName, columnName, seqName string) {
+	t, ok := s.Table(tableName)
+	if !ok {
+		return
+	}
+	c, ok := t.Column(columnName)
+	if !ok {
+		return
+	}
+	tt, ok := c.Type.Type.(*schema.IntegerType)
+	if !ok {
+		return
+	}
+	st := &SerialType{SequenceName: seqName}
+	st.SetType(tt)
+	c.Type.Raw = st.T
+	c.Type.Type = st
+	c.Default = nil // serial columns don't need an explicit DEFAULT
 }
 
 // mustFormat formats a schema.Type to its SQL string, returning an empty string on error.
@@ -2494,6 +2845,61 @@ func (s *state) createDropEventTrigger(et *EventTrigger) (string, string) {
 	return create, drop
 }
 
+// createDropAggregate returns CREATE and DROP statements for an aggregate function.
+func (s *state) createDropAggregate(a *Aggregate) (string, string) {
+	// Build argument type list for both CREATE and DROP.
+	argTypes := make([]string, len(a.Args))
+	for i, arg := range a.Args {
+		argTypes[i] = mustFormat(arg.Type)
+	}
+	argList := strings.Join(argTypes, ", ")
+
+	b := s.Build("CREATE AGGREGATE")
+	b.SchemaResource(a.Schema, a.Name)
+	b.P("(" + argList + ") (")
+	b.P("SFUNC =").Ident(a.StateFunc) // state transition function
+	b.P(", STYPE =", mustFormat(a.StateType))
+	if a.FinalFunc != "" {
+		b.P(", FINALFUNC =").Ident(a.FinalFunc)
+	}
+	if a.InitVal != "" {
+		b.P(", INITCOND = '" + a.InitVal + "'")
+	}
+	if a.SortOp != "" {
+		b.P(", SORTOP =", a.SortOp)
+	}
+	if a.Parallel != "" && a.Parallel != "UNSAFE" {
+		b.P(", PARALLEL =", a.Parallel)
+	}
+	b.P(")")
+	create := b.String()
+	db := s.Build("DROP AGGREGATE IF EXISTS")
+	db.SchemaResource(a.Schema, a.Name)
+	db.P("(" + argList + ")")
+	drop := db.String()
+	return create, drop
+}
+
+// createDropCast returns CREATE and DROP statements for a type cast.
+func (s *state) createDropCast(c *Cast) (string, string) {
+	create := fmt.Sprintf("CREATE CAST (%s AS %s)", c.Source, c.Target)
+	switch c.Method {
+	case "function":
+		create += " WITH FUNCTION " + c.FuncRef
+	case "inout":
+		create += " WITH INOUT"
+	default:
+		create += " WITHOUT FUNCTION"
+	}
+	if c.Context == "assignment" {
+		create += " AS ASSIGNMENT"
+	} else if c.Context == "implicit" {
+		create += " AS IMPLICIT"
+	}
+	drop := fmt.Sprintf("DROP CAST IF EXISTS (%s AS %s)", c.Source, c.Target)
+	return create, drop
+}
+
 // createDropComposite returns CREATE and DROP statements for a composite type.
 func (s *state) createDropComposite(c *CompositeType) (string, string) {
 	b := s.Build("CREATE TYPE")
@@ -2623,7 +3029,7 @@ func (*diff) ViewAttrChanges(from, to *schema.View) []schema.Change {
 // from one state to the other. For example, adding extensions or users.
 func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
 	var changes []schema.Change
-	// Drop extensions and event triggers.
+	// Drop realm-level objects.
 	for _, o1 := range from.Objects {
 		switch v1 := o1.(type) {
 		case *Extension:
@@ -2647,9 +3053,16 @@ func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
 			}); !ok {
 				changes = append(changes, &schema.DropObject{O: o1})
 			}
+		case *Cast:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				c2, ok := o.(*Cast)
+				return ok && v1.Source == c2.Source && v1.Target == c2.Target
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
 		}
 	}
-	// Add extensions, event triggers, and roles.
+	// Add realm-level objects.
 	for _, o1 := range to.Objects {
 		switch v1 := o1.(type) {
 		case *Extension:
@@ -2670,6 +3083,13 @@ func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
 			if _, ok := from.Object(func(o schema.Object) bool {
 				r2, ok := o.(*Role)
 				return ok && v1.Name == r2.Name
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *Cast:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				c2, ok := o.(*Cast)
+				return ok && v1.Source == c2.Source && v1.Target == c2.Target
 			}); !ok {
 				changes = append(changes, &schema.AddObject{O: v1})
 			}
@@ -2745,6 +3165,13 @@ func (d *diff) SchemaObjectDiff(from, to *schema.Schema, opts *schema.DiffOption
 			if v1.As != p2.As || v1.For != p2.For || v1.Using != p2.Using || v1.Check != p2.Check || !sqlx.ValuesEqual(v1.To, p2.To) {
 				changes = append(changes, &schema.ModifyObject{From: v1, To: p2})
 			}
+		case *Aggregate:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				a2, ok := o.(*Aggregate)
+				return ok && v1.Name == a2.Name
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
 		}
 	}
 	// Add new objects.
@@ -2796,6 +3223,13 @@ func (d *diff) SchemaObjectDiff(from, to *schema.Schema, opts *schema.DiffOption
 			if _, ok := from.Object(func(o schema.Object) bool {
 				p2, ok := o.(*Policy)
 				return ok && v1.Name == p2.Name && v1.Table != nil && p2.Table != nil && v1.Table.Name == p2.Table.Name
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *Aggregate:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				a2, ok := o.(*Aggregate)
+				return ok && v1.Name == a2.Name
 			}); !ok {
 				changes = append(changes, &schema.AddObject{O: v1})
 			}
@@ -2954,9 +3388,62 @@ func domainName(t *schemahcl.Type) (string, error) {
 	return parts[len(parts)-1], nil
 }
 
-func convertAggregate(d *doc, _ *schema.Realm) error {
-	if len(d.Aggregates) > 0 {
-		return fmt.Errorf("postgres: aggregates are not supported by this version. Use: https://atlasgo.io/getting-started")
+func convertAggregate(d *doc, r *schema.Realm) error {
+	for _, a := range d.Aggregates {
+		ns, err := specutil.SchemaName(a.Schema)
+		if err != nil {
+			return fmt.Errorf("postgres: aggregate %q: %w", a.Name, err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for aggregate %q not found", ns, a.Name)
+		}
+		agg := &Aggregate{
+			Name:   a.Name,
+			Schema: s,
+		}
+		if v, ok := a.Attr("state_func"); ok {
+			str, err := v.String()
+			if err == nil {
+				agg.StateFunc = str
+			} else if ref, err2 := v.Ref(); err2 == nil {
+				// e.g., function.my_func → extract "my_func"
+				parts := strings.Split(ref, ".")
+				agg.StateFunc = parts[len(parts)-1]
+			}
+		}
+		if v, ok := a.Attr("state_type"); ok {
+			str, err := v.String()
+			if err != nil {
+				return fmt.Errorf("postgres: aggregate %q state_type: %w", a.Name, err)
+			}
+			t, err := ParseType(str)
+			if err != nil {
+				t = &schema.UnsupportedType{T: str}
+			}
+			agg.StateType = t
+		}
+		if v, ok := a.Attr("initial_value"); ok {
+			str, _ := v.String()
+			agg.InitVal = str
+		}
+		if v, ok := a.Attr("parallel"); ok {
+			str, _ := v.String()
+			agg.Parallel = str
+		}
+		// Parse arguments.
+		for _, arg := range a.Args {
+			fa := &schema.FuncArg{Name: arg.Name}
+			if arg.Type != nil {
+				t, err := TypeRegistry.Type(arg.Type, nil)
+				if err != nil {
+					return fmt.Errorf("postgres: aggregate %q arg type: %w", a.Name, err)
+				}
+				fa.Type = t
+			}
+			agg.Args = append(agg.Args, fa)
+		}
+		s.Objects = append(s.Objects, agg)
 	}
 	return nil
 }
@@ -3429,6 +3916,36 @@ func objectSpec(d *doc, spec *specutil.SchemaSpec, s *schema.Schema) error {
 				rs.Extra.Attrs = append(rs.Extra.Attrs, schemahcl.StringAttr("multirange_type_name", o.MultirangeName))
 			}
 			d.Ranges = append(d.Ranges, rs)
+		case *Aggregate:
+			as := &aggregate{
+				Name:   o.Name,
+				Schema: ref,
+			}
+			as.Extra.Attrs = append(as.Extra.Attrs, schemahcl.StringAttr("state_func", o.StateFunc))
+			if o.StateType != nil {
+				as.Extra.Attrs = append(as.Extra.Attrs, schemahcl.StringAttr("state_type", mustFormat(o.StateType)))
+			}
+			if o.FinalFunc != "" {
+				as.Extra.Attrs = append(as.Extra.Attrs, schemahcl.StringAttr("final_func", o.FinalFunc))
+			}
+			if o.InitVal != "" {
+				as.Extra.Attrs = append(as.Extra.Attrs, schemahcl.StringAttr("initial_value", o.InitVal))
+			}
+			if o.Parallel != "" && o.Parallel != "UNSAFE" {
+				as.Extra.Attrs = append(as.Extra.Attrs, schemahcl.StringAttr("parallel", o.Parallel))
+			}
+			for _, arg := range o.Args {
+				fa := &sqlspec.FuncArg{Name: arg.Name}
+				if arg.Type != nil {
+					c, err := columnTypeSpec(arg.Type)
+					if err != nil {
+						return err
+					}
+					fa.Type = c.Type
+				}
+				as.Args = append(as.Args, fa)
+			}
+			d.Aggregates = append(d.Aggregates, as)
 		}
 	}
 	return nil
@@ -3747,6 +4264,93 @@ WHERE
 	n.nspname IN (%s)
 ORDER BY
 	n.nspname, c.relname
+`
+	// Query to list user-defined aggregates.
+	aggregatesQuery = `
+SELECT
+	n.nspname AS schema_name,
+	p.proname AS agg_name,
+	sf.proname AS state_func,
+	pg_catalog.format_type(a.aggtranstype, NULL) AS state_type,
+	ff.proname AS final_func,
+	a.agginitval AS init_val,
+	COALESCE(so.oprname, '') AS sort_op,
+	CASE p.proparallel
+		WHEN 's' THEN 'SAFE'
+		WHEN 'u' THEN 'UNSAFE'
+		WHEN 'r' THEN 'RESTRICTED'
+		ELSE ''
+	END AS parallel,
+	pg_catalog.pg_get_function_identity_arguments(p.oid) AS arg_types
+FROM
+	pg_catalog.pg_aggregate a
+	JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid
+	JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+	JOIN pg_catalog.pg_proc sf ON sf.oid = a.aggtransfn
+	LEFT JOIN pg_catalog.pg_proc ff ON ff.oid = a.aggfinalfn
+	LEFT JOIN pg_catalog.pg_operator so ON so.oid = a.aggsortop
+WHERE
+	n.nspname IN (%s)
+ORDER BY
+	n.nspname, p.proname
+`
+	// Query to find dependencies between objects using pg_depend.
+	// Returns (source_schema, source_name, source_kind, dep_schema, dep_name, dep_kind) rows.
+	depsQuery = `
+SELECT DISTINCT
+	src_ns.nspname  AS src_schema,
+	COALESCE(src_proc.proname, src_rel.relname) AS src_name,
+	CASE
+		WHEN src_proc.oid IS NOT NULL AND src_proc.prokind = 'p' THEN 'procedure'
+		WHEN src_proc.oid IS NOT NULL THEN 'function'
+		WHEN src_rel.relkind = 'r' THEN 'table'
+		WHEN src_rel.relkind = 'v' THEN 'view'
+		WHEN src_rel.relkind = 'm' THEN 'matview'
+		ELSE 'unknown'
+	END AS src_kind,
+	dep_ns.nspname  AS dep_schema,
+	COALESCE(dep_proc.proname, dep_rel.relname, dep_typ.typname) AS dep_name,
+	CASE
+		WHEN dep_proc.oid IS NOT NULL AND dep_proc.prokind = 'p' THEN 'procedure'
+		WHEN dep_proc.oid IS NOT NULL THEN 'function'
+		WHEN dep_rel.relkind = 'r' THEN 'table'
+		WHEN dep_rel.relkind = 'v' THEN 'view'
+		WHEN dep_rel.relkind = 'm' THEN 'matview'
+		WHEN dep_typ.typtype = 'e' THEN 'enum'
+		WHEN dep_typ.typtype = 'd' THEN 'domain'
+		WHEN dep_typ.typtype = 'c' THEN 'composite'
+		ELSE 'unknown'
+	END AS dep_kind
+FROM pg_catalog.pg_depend d
+-- Source: function/procedure
+LEFT JOIN pg_catalog.pg_proc src_proc ON d.classid = 'pg_proc'::regclass AND src_proc.oid = d.objid
+LEFT JOIN pg_catalog.pg_namespace src_proc_ns ON src_proc.pronamespace = src_proc_ns.oid
+-- Source: table/view
+LEFT JOIN pg_catalog.pg_class src_rel ON d.classid = 'pg_class'::regclass AND src_rel.oid = d.objid AND src_rel.relkind IN ('r', 'v', 'm')
+LEFT JOIN pg_catalog.pg_namespace src_rel_ns ON src_rel.relnamespace = src_rel_ns.oid
+-- Combined source namespace
+CROSS JOIN LATERAL (SELECT COALESCE(src_proc_ns.nspname, src_rel_ns.nspname) AS nspname) src_ns
+-- Dependency target: table/view
+LEFT JOIN pg_catalog.pg_class dep_rel ON d.refclassid = 'pg_class'::regclass AND dep_rel.oid = d.refobjid AND dep_rel.relkind IN ('r', 'v', 'm')
+LEFT JOIN pg_catalog.pg_namespace dep_rel_ns ON dep_rel.relnamespace = dep_rel_ns.oid
+-- Dependency target: function/procedure
+LEFT JOIN pg_catalog.pg_proc dep_proc ON d.refclassid = 'pg_proc'::regclass AND dep_proc.oid = d.refobjid
+LEFT JOIN pg_catalog.pg_namespace dep_proc_ns ON dep_proc.pronamespace = dep_proc_ns.oid
+-- Dependency target: type (enum, domain, composite)
+LEFT JOIN pg_catalog.pg_type dep_typ ON d.refclassid = 'pg_type'::regclass AND dep_typ.oid = d.refobjid AND dep_typ.typtype IN ('e', 'd', 'c')
+LEFT JOIN pg_catalog.pg_namespace dep_typ_ns ON dep_typ.typnamespace = dep_typ_ns.oid
+-- Combined dep namespace
+CROSS JOIN LATERAL (SELECT COALESCE(dep_rel_ns.nspname, dep_proc_ns.nspname, dep_typ_ns.nspname) AS nspname) dep_ns
+WHERE
+	d.deptype IN ('n', 'a')
+	AND (src_proc.oid IS NOT NULL OR src_rel.oid IS NOT NULL)
+	AND (dep_rel.oid IS NOT NULL OR dep_proc.oid IS NOT NULL OR dep_typ.oid IS NOT NULL)
+	-- Exclude self-references
+	AND NOT (d.classid = d.refclassid AND d.objid = d.refobjid)
+	-- Only user schemas
+	AND src_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+	AND dep_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY src_ns.nspname, src_name, dep_ns.nspname, dep_name
 `
 	// Query to list collations defined in the schemas.
 	collationsQuery = `
