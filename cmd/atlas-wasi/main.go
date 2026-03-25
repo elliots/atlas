@@ -164,7 +164,6 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 
 	// Execute SQL statements one by one using FileStmts for correct splitting
 	// (handles dollar-quoted function bodies, multi-line strings, etc.)
-	// Session state (SET check_function_bodies, etc.) persists across statements.
 	dir, err := filesToDir(files, fileNames)
 	if err != nil {
 		return nil, err

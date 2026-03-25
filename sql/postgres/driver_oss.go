@@ -1809,8 +1809,22 @@ func (i *inspect) inspectAggregates(ctx context.Context, r *schema.Realm, _ *sch
 			}
 		}
 		// Set dependencies on the state/final functions.
+		// Match by name, stripping any schema qualifier (e.g., "public._group_concat" → "_group_concat").
+		matchFunc := func(fname, target string) bool {
+			if target == "" {
+				return false
+			}
+			if fname == target {
+				return true
+			}
+			// Strip schema qualifier from target.
+			if i := strings.LastIndex(target, "."); i >= 0 {
+				return fname == target[i+1:]
+			}
+			return false
+		}
 		for _, f := range s.Funcs {
-			if f.Name == agg.StateFunc || (agg.FinalFunc != "" && f.Name == agg.FinalFunc) {
+			if matchFunc(f.Name, agg.StateFunc) || matchFunc(f.Name, agg.FinalFunc) {
 				agg.Deps = append(agg.Deps, f)
 			}
 		}
@@ -2857,10 +2871,23 @@ func (s *state) createDropAggregate(a *Aggregate) (string, string) {
 	b := s.Build("CREATE AGGREGATE")
 	b.SchemaResource(a.Schema, a.Name)
 	b.P("(" + argList + ") (")
-	b.P("SFUNC =").Ident(a.StateFunc) // state transition function
+	// Schema-qualify function references so they resolve regardless of search_path.
+	sfunc := a.StateFunc
+	if a.Schema != nil && a.Schema.Name != "" && !strings.Contains(sfunc, ".") {
+		sfunc = fmt.Sprintf("%q.%q", a.Schema.Name, sfunc)
+	} else {
+		sfunc = fmt.Sprintf("%q", sfunc)
+	}
+	b.P("SFUNC =", sfunc)
 	b.P(", STYPE =", mustFormat(a.StateType))
 	if a.FinalFunc != "" {
-		b.P(", FINALFUNC =").Ident(a.FinalFunc)
+		ffunc := a.FinalFunc
+		if a.Schema != nil && a.Schema.Name != "" && !strings.Contains(ffunc, ".") {
+			ffunc = fmt.Sprintf("%q.%q", a.Schema.Name, ffunc)
+		} else {
+			ffunc = fmt.Sprintf("%q", ffunc)
+		}
+		b.P(", FINALFUNC =", ffunc)
 	}
 	if a.InitVal != "" {
 		b.P(", INITCOND = '" + a.InitVal + "'")
