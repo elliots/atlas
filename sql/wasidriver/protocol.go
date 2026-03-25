@@ -9,9 +9,10 @@ package wasidriver
 
 // Request is sent from the WASI module to the host to execute SQL.
 type Request struct {
-	Type string `json:"type"` // "query" or "exec"
-	SQL  string `json:"sql"`
-	Args []any  `json:"args,omitempty"`
+	Type       string `json:"type"`                 // "query" or "exec"
+	SQL        string `json:"sql"`
+	Args       []any  `json:"args,omitempty"`
+	Connection string `json:"connection,omitempty"` // "dev" (default), "from", or "to"
 }
 
 // Response is returned by the host after executing SQL.

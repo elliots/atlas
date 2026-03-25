@@ -34,18 +34,23 @@ func SetExecFunc(fn ExecFunc) {
 // Driver implements database/sql/driver.Driver.
 type Driver struct{}
 
-func (d *Driver) Open(_ string) (driver.Conn, error) {
+func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	if hostExec == nil {
 		return nil, errors.New("wasidriver: host exec function not set; call SetExecFunc first")
 	}
-	return &conn{}, nil
+	if dsn == "" {
+		return nil, errors.New("wasidriver: connection name (DSN) is required — use \"dev\", \"from\", or \"to\"")
+	}
+	return &conn{connection: dsn}, nil
 }
 
 // conn implements driver.Conn.
-type conn struct{}
+type conn struct {
+	connection string // "dev" (default), "from", or "to"
+}
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
-	return &stmt{query: query}, nil
+	return &stmt{query: query, connection: c.connection}, nil
 }
 
 func (c *conn) Close() error { return nil }
@@ -58,16 +63,17 @@ func (c *conn) Begin() (driver.Tx, error) {
 // (avoids the Prepare/Execute/Close cycle for each query).
 
 func (c *conn) QueryContext(_ interface{}, query string, args []driver.NamedValue) (driver.Rows, error) {
-	return doQuery(query, namedToValues(args))
+	return doQuery(c.connection, query, namedToValues(args))
 }
 
 func (c *conn) ExecContext(_ interface{}, query string, args []driver.NamedValue) (driver.Result, error) {
-	return doExec(query, namedToValues(args))
+	return doExec(c.connection, query, namedToValues(args))
 }
 
 // stmt implements driver.Stmt.
 type stmt struct {
-	query string
+	query      string
+	connection string
 }
 
 func (s *stmt) Close() error { return nil }
@@ -75,11 +81,11 @@ func (s *stmt) Close() error { return nil }
 func (s *stmt) NumInput() int { return -1 } // unknown
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
-	return doExec(s.query, args)
+	return doExec(s.connection, s.query, args)
 }
 
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
-	return doQuery(s.query, args)
+	return doQuery(s.connection, s.query, args)
 }
 
 // tx implements driver.Tx.
@@ -88,18 +94,18 @@ type tx struct {
 }
 
 func (t *tx) Commit() error {
-	_, err := doExec("COMMIT", nil)
+	_, err := doExec(t.c.connection, "COMMIT", nil)
 	return err
 }
 
 func (t *tx) Rollback() error {
-	_, err := doExec("ROLLBACK", nil)
+	_, err := doExec(t.c.connection, "ROLLBACK", nil)
 	return err
 }
 
 // doQuery executes a query via the host and returns rows.
-func doQuery(query string, args []driver.Value) (driver.Rows, error) {
-	resp, err := callHost("query", query, args)
+func doQuery(connection, query string, args []driver.Value) (driver.Rows, error) {
+	resp, err := callHost(connection, "query", query, args)
 	if err != nil {
 		return nil, err
 	}
@@ -111,8 +117,8 @@ func doQuery(query string, args []driver.Value) (driver.Rows, error) {
 }
 
 // doExec executes a statement via the host and returns the result.
-func doExec(query string, args []driver.Value) (driver.Result, error) {
-	resp, err := callHost("exec", query, args)
+func doExec(connection, query string, args []driver.Value) (driver.Result, error) {
+	resp, err := callHost(connection, "exec", query, args)
 	if err != nil {
 		return nil, err
 	}
@@ -123,16 +129,17 @@ func doExec(query string, args []driver.Value) (driver.Result, error) {
 }
 
 // callHost marshals a request, calls the host, and unmarshals the response.
-func callHost(typ, query string, args []driver.Value) (*Response, error) {
+func callHost(connection, typ, query string, args []driver.Value) (*Response, error) {
 	// Convert driver.Value args to []any for JSON.
 	jsonArgs := make([]any, len(args))
 	for i, a := range args {
 		jsonArgs[i] = a
 	}
 	req := Request{
-		Type: typ,
-		SQL:  query,
-		Args: jsonArgs,
+		Type:       typ,
+		SQL:        query,
+		Args:       jsonArgs,
+		Connection: connection,
 	}
 	reqBytes, err := json.Marshal(req)
 	if err != nil {

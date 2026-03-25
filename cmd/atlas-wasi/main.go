@@ -64,6 +64,11 @@ type Cmd struct {
 	From []string `json:"from,omitempty"`
 	To   []string `json:"to,omitempty"`
 
+	// For "diff": use a live database connection instead of SQL files.
+	// Values: "from" or "to" — the host routes SQL to the right adapter.
+	FromConnection string `json:"fromConnection,omitempty"`
+	ToConnection   string `json:"toConnection,omitempty"`
+
 	// For "diff": known renames from @docs.previously tags.
 	Renames []Rename `json:"renames,omitempty"`
 }
@@ -131,11 +136,6 @@ func handleCmd(cmd Cmd) (*Result, error) {
 // execAndInspect executes SQL files, inspects the schema, and applies tags.
 func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fileNames []string, schemaName string) (*schema.Realm, error) {
 	// Extract tags from SQL comments before executing (comments are lost on execution).
-	dir, err := filesToDir(files, fileNames)
-	if err != nil {
-		return nil, err
-	}
-	// Extract tags per-file so errors include the filename.
 	tagIdx := &migrate.TagIndex{
 		TableTags:  make(map[string][]*schema.Tag),
 		ColumnTags: make(map[string][]*schema.Tag),
@@ -162,20 +162,15 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 		}
 	}
 
-	// Execute the SQL on the database, tracking which file each statement came from.
-	dirFiles, err := dir.Files()
-	if err != nil {
-		return nil, err
-	}
-	for _, f := range dirFiles {
-		fileStmts, err := migrate.FileStmts(drv, f)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", f.Name(), err)
+	// Execute each file as a single batch to preserve SET session state
+	// and handle pg_dump output with forward references.
+	for i, f := range files {
+		name := fmt.Sprintf("%d.sql", i)
+		if i < len(fileNames) && fileNames[i] != "" {
+			name = fileNames[i]
 		}
-		for _, s := range fileStmts {
-			if _, err := drv.ExecContext(ctx, s); err != nil {
-				return nil, fmt.Errorf("%s: %w", f.Name(), err)
-			}
+		if _, err := drv.ExecContext(ctx, f); err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
 
@@ -188,6 +183,7 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 		}
 		realm = schema.NewRealm(s)
 	} else {
+		var err error
 		realm, err = drv.InspectRealm(ctx, nil)
 		if err != nil {
 			return nil, err
@@ -239,30 +235,53 @@ func cmdApply(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error)
 
 // cmdDiff compares two sets of SQL files and returns migration statements.
 func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) {
-	// Snapshot verifies the database is empty and provides a restore function
-	// to reset between the two diff passes.
-	sn, ok := drv.(migrate.Snapshoter)
-	if !ok {
-		return nil, fmt.Errorf("driver does not implement Snapshoter")
-	}
-	restore, err := sn.Snapshot(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot: %w", err)
-	}
-	defer restore(ctx) //nolint
-	fromRealm, err := execAndInspect(ctx, drv, cmd.From, nil, cmd.Schema)
-	if err != nil {
-		return nil, fmt.Errorf("from: %w", err)
+	var fromRealm, toRealm *schema.Realm
+	var err error
+
+	// Inspect "from" side: live connection or SQL files
+	if cmd.FromConnection != "" {
+		fromRealm, err = inspectConnection(ctx, cmd.Dialect, cmd.FromConnection, cmd.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("from connection: %w", err)
+		}
 	}
 
-	// Restore to empty state before the "to" pass.
-	if err := restore(ctx); err != nil {
-		return nil, fmt.Errorf("restore: %w", err)
+	// Inspect "to" side: live connection or SQL files
+	if cmd.ToConnection != "" {
+		toRealm, err = inspectConnection(ctx, cmd.Dialect, cmd.ToConnection, cmd.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("to connection: %w", err)
+		}
 	}
 
-	toRealm, err := execAndInspect(ctx, drv, cmd.To, nil, cmd.Schema)
-	if err != nil {
-		return nil, fmt.Errorf("to: %w", err)
+	// For sides that use SQL files, load them into the dev DB via snapshot
+	if fromRealm == nil || toRealm == nil {
+		sn, ok := drv.(migrate.Snapshoter)
+		if !ok {
+			return nil, fmt.Errorf("driver does not implement Snapshoter")
+		}
+		restore, err := sn.Snapshot(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot: %w", err)
+		}
+		defer restore(ctx) //nolint
+
+		if fromRealm == nil {
+			fromRealm, err = execAndInspect(ctx, drv, cmd.From, nil, cmd.Schema)
+			if err != nil {
+				return nil, fmt.Errorf("from: %w", err)
+			}
+		}
+
+		if toRealm == nil {
+			if err := restore(ctx); err != nil {
+				return nil, fmt.Errorf("restore: %w", err)
+			}
+			toRealm, err = execAndInspect(ctx, drv, cmd.To, nil, cmd.Schema)
+			if err != nil {
+				return nil, fmt.Errorf("to: %w", err)
+			}
+		}
 	}
 
 	// Apply known renames: modify the FROM realm so Atlas sees the objects
@@ -696,7 +715,11 @@ func allStmts(drv migrate.Driver, dir migrate.Dir) ([]string, error) {
 
 // openDriver creates an Atlas driver using the WASI database/sql connection.
 func openDriver(dialect string) (migrate.Driver, error) {
-	db, err := sql.Open("wasi", "")
+	return openDriverWithConnection(dialect, "dev")
+}
+
+func openDriverWithConnection(dialect, connection string) (migrate.Driver, error) {
+	db, err := sql.Open("wasi", connection)
 	if err != nil {
 		return nil, fmt.Errorf("open wasi db: %w", err)
 	}
@@ -710,6 +733,22 @@ func openDriver(dialect string) (migrate.Driver, error) {
 	default:
 		return nil, fmt.Errorf("unsupported dialect: %q", dialect)
 	}
+}
+
+// inspectConnection opens a driver on a named connection and inspects the current DB state.
+func inspectConnection(ctx context.Context, dialect, connection, schemaName string) (*schema.Realm, error) {
+	drv, err := openDriverWithConnection(dialect, connection)
+	if err != nil {
+		return nil, err
+	}
+	if schemaName != "" {
+		s, err := drv.InspectSchema(ctx, schemaName, nil)
+		if err != nil {
+			return nil, err
+		}
+		return schema.NewRealm(s), nil
+	}
+	return drv.InspectRealm(ctx, nil)
 }
 
 func fatal(format string, args ...any) {
