@@ -90,8 +90,22 @@ func (c *Codec) MarshalSpec(v any) ([]byte, error) {
 	})
 }
 
-func triggersSpec([]*schema.Trigger, *specutil.Doc) ([]*sqlspec.Trigger, error) {
-	return nil, nil // unimplemented.
+func triggersSpec(triggers []*schema.Trigger, _ *specutil.Doc) ([]*sqlspec.Trigger, error) {
+	specs := make([]*sqlspec.Trigger, 0, len(triggers))
+	for _, t := range triggers {
+		spec := &sqlspec.Trigger{Name: t.Name}
+		switch {
+		case t.Table != nil:
+			spec.On = schemahcl.BuildRef([]schemahcl.PathIndex{{T: "table", V: []string{t.Table.Name}}})
+		case t.View != nil:
+			spec.On = schemahcl.BuildRef([]schemahcl.PathIndex{{T: "view", V: []string{t.View.Name}}})
+		}
+		if t.Body != "" {
+			spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringAttr("as", t.Body))
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
 }
 
 var (
@@ -135,15 +149,154 @@ var (
 	// EvalMariaHCLBytes is a helper that evaluates a MariaDB HCL document from a byte slice.
 	EvalMariaHCLBytes             = specutil.HCLBytesFunc(EvalMariaHCL)
 	specOptions, mariaSpecOptions []schemahcl.Option
-	specFuncs                     = &specutil.SchemaFuncs{
+	specFuncs = &specutil.SchemaFuncs{
 		Table: tableSpec,
 		View:  viewSpec,
+		Func:  funcSpec,
+		Proc:  procSpec,
 	}
 	scanFuncs = &specutil.ScanFuncs{
 		Table: convertTable,
 		View:  convertView,
+		Func:  convertFunc,
+		Proc:  convertProc,
 	}
 )
+
+// funcSpec converts a schema.Func to a sqlspec.Func for HCL marshaling.
+func funcSpec(f *schema.Func) (*sqlspec.Func, error) {
+	spec := &sqlspec.Func{Name: f.Name}
+	for _, a := range f.Args {
+		arg := &sqlspec.FuncArg{Name: a.Name}
+		if a.Type != nil {
+			c, err := columnTypeSpec(a.Type)
+			if err != nil {
+				return nil, fmt.Errorf("function %q arg %q type: %w", f.Name, a.Name, err)
+			}
+			arg.Type = c.Type
+		}
+		if a.Mode != "" && a.Mode != schema.FuncArgModeIn {
+			arg.Extra.Attrs = append(arg.Extra.Attrs, schemahcl.StringAttr("mode", string(a.Mode)))
+		}
+		spec.Args = append(spec.Args, arg)
+	}
+	if f.Ret != nil {
+		if u, ok := f.Ret.(*schema.UnsupportedType); ok {
+			spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.RawAttr("return", u.T))
+		} else {
+			c, err := columnTypeSpec(f.Ret)
+			if err != nil {
+				return nil, fmt.Errorf("function %q return type: %w", f.Name, err)
+			}
+			spec.Extra.Attrs = append(spec.Extra.Attrs, specutil.TypeAttr("return", c.Type))
+		}
+	}
+	if f.Body != "" {
+		spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringAttr("as", sqlspec.MightHeredoc(f.Body)))
+	}
+	return spec, nil
+}
+
+// procSpec converts a schema.Proc to a sqlspec.Func for HCL marshaling.
+func procSpec(p *schema.Proc) (*sqlspec.Func, error) {
+	spec := &sqlspec.Func{Name: p.Name}
+	for _, a := range p.Args {
+		arg := &sqlspec.FuncArg{Name: a.Name}
+		if a.Type != nil {
+			c, err := columnTypeSpec(a.Type)
+			if err != nil {
+				return nil, fmt.Errorf("procedure %q arg %q type: %w", p.Name, a.Name, err)
+			}
+			arg.Type = c.Type
+		}
+		if a.Mode != "" && a.Mode != schema.FuncArgModeIn {
+			arg.Extra.Attrs = append(arg.Extra.Attrs, schemahcl.StringAttr("mode", string(a.Mode)))
+		}
+		spec.Args = append(spec.Args, arg)
+	}
+	if p.Body != "" {
+		spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringAttr("as", sqlspec.MightHeredoc(p.Body)))
+	}
+	return spec, nil
+}
+
+// convertFunc converts a sqlspec.Func (HCL) to a schema.Func.
+func convertFunc(spec *sqlspec.Func, parent *schema.Schema) (*schema.Func, error) {
+	f := &schema.Func{Name: spec.Name, Schema: parent}
+	for _, sa := range spec.Args {
+		arg := &schema.FuncArg{Name: sa.Name}
+		if sa.Type != nil {
+			t, err := TypeRegistry.Type(sa.Type, sa.Extra.Attrs)
+			if err != nil {
+				return nil, fmt.Errorf("function %q arg %q: %w", f.Name, sa.Name, err)
+			}
+			arg.Type = t
+		}
+		if m, ok := sa.Attr("mode"); ok {
+			s, err := m.String()
+			if err != nil {
+				return nil, err
+			}
+			arg.Mode = schema.FuncArgMode(s)
+		}
+		f.Args = append(f.Args, arg)
+	}
+	if rt, ok := spec.Attr("return"); ok {
+		typ, err := rt.Type()
+		if err != nil {
+			if rt.IsRawExpr() {
+				if raw, err := rt.RawExpr(); err == nil {
+					f.Ret = &schema.UnsupportedType{T: raw.X}
+				}
+			}
+		} else {
+			t, err := TypeRegistry.Type(typ, nil)
+			if err != nil {
+				return nil, fmt.Errorf("function %q return type: %w", f.Name, err)
+			}
+			f.Ret = t
+		}
+	}
+	if a, ok := spec.Attr("as"); ok {
+		s, err := a.String()
+		if err != nil {
+			return nil, err
+		}
+		f.Body = s
+	}
+	return f, nil
+}
+
+// convertProc converts a sqlspec.Func (HCL) to a schema.Proc.
+func convertProc(spec *sqlspec.Func, parent *schema.Schema) (*schema.Proc, error) {
+	p := &schema.Proc{Name: spec.Name, Schema: parent}
+	for _, sa := range spec.Args {
+		arg := &schema.FuncArg{Name: sa.Name}
+		if sa.Type != nil {
+			t, err := TypeRegistry.Type(sa.Type, sa.Extra.Attrs)
+			if err != nil {
+				return nil, fmt.Errorf("procedure %q arg %q: %w", p.Name, sa.Name, err)
+			}
+			arg.Type = t
+		}
+		if m, ok := sa.Attr("mode"); ok {
+			s, err := m.String()
+			if err != nil {
+				return nil, err
+			}
+			arg.Mode = schema.FuncArgMode(s)
+		}
+		p.Args = append(p.Args, arg)
+	}
+	if a, ok := spec.Attr("as"); ok {
+		s, err := a.String()
+		if err != nil {
+			return nil, err
+		}
+		p.Body = s
+	}
+	return p, nil
+}
 
 // convertTable converts a sqlspec.Table to a schema.Table. Table conversion is done without converting
 // ForeignKeySpecs into ForeignKeys, as the target tables do not necessarily exist in the schema

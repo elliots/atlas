@@ -43,6 +43,21 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 			}
 			sqlx.LinkSchemaTables(schemas)
 		}
+		if mode.Is(schema.InspectViews) {
+			if err := i.inspectViews(ctx, r, nil); err != nil {
+				return nil, err
+			}
+		}
+		if mode.Is(schema.InspectFuncs) {
+			if err := i.inspectFuncs(ctx, r, nil); err != nil {
+				return nil, err
+			}
+		}
+		if mode.Is(schema.InspectTriggers) {
+			if err := i.inspectTriggers(ctx, r, nil); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return schema.ExcludeRealm(r, opts.Exclude)
 }
@@ -73,6 +88,21 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 		}
 		sqlx.LinkSchemaTables(schemas)
 	}
+	if mode.Is(schema.InspectViews) {
+		if err := i.inspectViews(ctx, r, opts); err != nil {
+			return nil, err
+		}
+	}
+	if mode.Is(schema.InspectFuncs) {
+		if err := i.inspectFuncs(ctx, r, opts); err != nil {
+			return nil, err
+		}
+	}
+	if mode.Is(schema.InspectTriggers) {
+		if err := i.inspectTriggers(ctx, r, opts); err != nil {
+			return nil, err
+		}
+	}
 	return schema.ExcludeSchema(r.Schemas[0], opts.Exclude)
 }
 
@@ -97,6 +127,9 @@ func (i *inspect) inspectTables(ctx context.Context, r *schema.Realm, opts *sche
 			return err
 		}
 		if err := i.showCreate(ctx, s); err != nil {
+			return err
+		}
+		if err := i.inspectPartitions(ctx, s); err != nil {
 			return err
 		}
 	}
@@ -790,7 +823,326 @@ ORDER BY
 	BINARY t1.TABLE_NAME,
 	BINARY t1.CONSTRAINT_NAME,
 	t1.ORDINAL_POSITION`
+
+	viewsQuery = `
+SELECT
+	TABLE_SCHEMA,
+	TABLE_NAME,
+	VIEW_DEFINITION,
+	CHECK_OPTION
+FROM
+	INFORMATION_SCHEMA.VIEWS
+WHERE
+	TABLE_SCHEMA IN (%s)
+ORDER BY
+	TABLE_SCHEMA, TABLE_NAME`
+
+	triggersQuery = `
+SELECT
+	TRIGGER_SCHEMA,
+	TRIGGER_NAME,
+	EVENT_OBJECT_TABLE,
+	ACTION_TIMING,
+	EVENT_MANIPULATION,
+	ACTION_STATEMENT
+FROM
+	INFORMATION_SCHEMA.TRIGGERS
+WHERE
+	TRIGGER_SCHEMA IN (%s)
+ORDER BY
+	TRIGGER_SCHEMA, EVENT_OBJECT_TABLE, TRIGGER_NAME`
+
+	routinesQuery = `
+SELECT
+	ROUTINE_SCHEMA,
+	ROUTINE_NAME,
+	ROUTINE_TYPE,
+	ROUTINE_DEFINITION,
+	EXTERNAL_LANGUAGE,
+	DTD_IDENTIFIER
+FROM
+	INFORMATION_SCHEMA.ROUTINES
+WHERE
+	ROUTINE_SCHEMA IN (%s)
+ORDER BY
+	ROUTINE_SCHEMA, ROUTINE_TYPE, ROUTINE_NAME`
+
+	parametersQuery = `
+SELECT
+	SPECIFIC_SCHEMA,
+	SPECIFIC_NAME,
+	ORDINAL_POSITION,
+	PARAMETER_MODE,
+	PARAMETER_NAME,
+	DTD_IDENTIFIER
+FROM
+	INFORMATION_SCHEMA.PARAMETERS
+WHERE
+	SPECIFIC_SCHEMA IN (%s)
+	AND ORDINAL_POSITION > 0
+ORDER BY
+	SPECIFIC_SCHEMA, SPECIFIC_NAME, ORDINAL_POSITION`
+
+	partitionsQuery = `
+SELECT
+	TABLE_NAME,
+	PARTITION_METHOD,
+	PARTITION_EXPRESSION
+FROM
+	INFORMATION_SCHEMA.PARTITIONS
+WHERE
+	TABLE_SCHEMA = ?
+	AND TABLE_NAME IN (%s)
+	AND PARTITION_NAME IS NOT NULL
+GROUP BY
+	TABLE_NAME, PARTITION_METHOD, PARTITION_EXPRESSION
+ORDER BY
+	TABLE_NAME`
 )
+
+// inspectViews queries and attaches views to each schema in the realm.
+func (i *inspect) inspectViews(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, len(r.Schemas))
+	for j, s := range r.Schemas {
+		args[j] = s.Name
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(viewsQuery, nArgs(len(r.Schemas))), args...)
+	if err != nil {
+		return fmt.Errorf("mysql: querying views: %w", err)
+	}
+	defer rows.Close()
+	schemas := make(map[string]*schema.Schema, len(r.Schemas))
+	for _, s := range r.Schemas {
+		schemas[s.Name] = s
+	}
+	for rows.Next() {
+		var sName, vName, def, checkOpt string
+		if err := rows.Scan(&sName, &vName, &def, &checkOpt); err != nil {
+			return fmt.Errorf("mysql: scanning view: %w", err)
+		}
+		s, ok := schemas[sName]
+		if !ok {
+			continue
+		}
+		v := schema.NewView(vName, def).SetSchema(s)
+		switch strings.ToUpper(checkOpt) {
+		case schema.ViewCheckOptionLocal:
+			v.SetCheckOption(schema.ViewCheckOptionLocal)
+		case schema.ViewCheckOptionCascaded:
+			v.SetCheckOption(schema.ViewCheckOptionCascaded)
+		}
+		s.Views = append(s.Views, v)
+	}
+	return rows.Err()
+}
+
+// inspectTriggers queries and attaches triggers to each table/view in the realm.
+func (i *inspect) inspectTriggers(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, len(r.Schemas))
+	for j, s := range r.Schemas {
+		args[j] = s.Name
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(triggersQuery, nArgs(len(r.Schemas))), args...)
+	if err != nil {
+		return fmt.Errorf("mysql: querying triggers: %w", err)
+	}
+	defer rows.Close()
+	schemas := make(map[string]*schema.Schema, len(r.Schemas))
+	for _, s := range r.Schemas {
+		schemas[s.Name] = s
+	}
+	for rows.Next() {
+		var sName, tName, tblName, timing, event, body string
+		if err := rows.Scan(&sName, &tName, &tblName, &timing, &event, &body); err != nil {
+			return fmt.Errorf("mysql: scanning trigger: %w", err)
+		}
+		s, ok := schemas[sName]
+		if !ok {
+			continue
+		}
+		t := &schema.Trigger{Name: tName}
+		switch strings.ToUpper(timing) {
+		case "BEFORE":
+			t.ActionTime = schema.TriggerTimeBefore
+		case "AFTER":
+			t.ActionTime = schema.TriggerTimeAfter
+		}
+		switch strings.ToUpper(event) {
+		case "INSERT":
+			t.Events = append(t.Events, schema.TriggerEventInsert)
+		case "UPDATE":
+			t.Events = append(t.Events, schema.TriggerEventUpdate)
+		case "DELETE":
+			t.Events = append(t.Events, schema.TriggerEventDelete)
+		}
+		// MySQL only supports row-level triggers.
+		t.For = schema.TriggerForRow
+		// Build the full CREATE TRIGGER body.
+		t.Body = buildTriggerBody(tName, tblName, timing, event, body)
+		// Attach to the owning table.
+		for _, tbl := range s.Tables {
+			if tbl.Name == tblName {
+				t.Table = tbl
+				t.Deps = append(t.Deps, tbl)
+				tbl.Triggers = append(tbl.Triggers, t)
+				break
+			}
+		}
+		// Or view.
+		if t.Table == nil {
+			for _, v := range s.Views {
+				if v.Name == tblName {
+					t.View = v
+					t.Deps = append(t.Deps, v)
+					v.Triggers = append(v.Triggers, t)
+					break
+				}
+			}
+		}
+	}
+	return rows.Err()
+}
+
+// inspectFuncs queries and attaches functions and stored procedures to each schema in the realm.
+func (i *inspect) inspectFuncs(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	if len(r.Schemas) == 0 {
+		return nil
+	}
+	args := make([]any, len(r.Schemas))
+	for j, s := range r.Schemas {
+		args[j] = s.Name
+	}
+	schemas := make(map[string]*schema.Schema, len(r.Schemas))
+	for _, s := range r.Schemas {
+		schemas[s.Name] = s
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(routinesQuery, nArgs(len(r.Schemas))), args...)
+	if err != nil {
+		return fmt.Errorf("mysql: querying routines: %w", err)
+	}
+	defer rows.Close()
+	type routineKey struct{ schema, name, rtype string }
+	type routineInfo struct {
+		s       *schema.Schema
+		rtype   string
+		body    string
+		lang    string
+		retType string
+	}
+	var order []routineKey
+	routines := make(map[routineKey]*routineInfo)
+	for rows.Next() {
+		var sName, name, rtype, body, lang string
+		var retType sql.NullString
+		if err := rows.Scan(&sName, &name, &rtype, &body, &lang, &retType); err != nil {
+			return fmt.Errorf("mysql: scanning routine: %w", err)
+		}
+		s, ok := schemas[sName]
+		if !ok {
+			continue
+		}
+		k := routineKey{sName, name, rtype}
+		if _, ok := routines[k]; !ok {
+			order = append(order, k)
+		}
+		routines[k] = &routineInfo{s: s, rtype: rtype, body: body, lang: lang, retType: retType.String}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Fetch parameters.
+	paramsRows, err := i.QueryContext(ctx, fmt.Sprintf(parametersQuery, nArgs(len(r.Schemas))), args...)
+	if err != nil {
+		return fmt.Errorf("mysql: querying parameters: %w", err)
+	}
+	defer paramsRows.Close()
+	params := make(map[string][]*schema.FuncArg) // key: "schema\x00name"
+	for paramsRows.Next() {
+		var sName, rName string
+		var ordinal int
+		var mode, pName, typ string
+		if err := paramsRows.Scan(&sName, &rName, &ordinal, &mode, &pName, &typ); err != nil {
+			return fmt.Errorf("mysql: scanning parameter: %w", err)
+		}
+		arg := &schema.FuncArg{Name: pName}
+		if t, err := ParseType(typ); err == nil {
+			arg.Type = t
+		} else {
+			arg.Type = &schema.UnsupportedType{T: typ}
+		}
+		switch strings.ToUpper(mode) {
+		case "IN":
+			arg.Mode = schema.FuncArgModeIn
+		case "OUT":
+			arg.Mode = schema.FuncArgModeOut
+		case "INOUT":
+			arg.Mode = schema.FuncArgModeInOut
+		}
+		key := sName + "\x00" + rName
+		params[key] = append(params[key], arg)
+	}
+	if err := paramsRows.Err(); err != nil {
+		return err
+	}
+	for _, k := range order {
+		info := routines[k]
+		funcArgs := params[k.schema+"\x00"+k.name]
+		switch k.rtype {
+		case "FUNCTION":
+			f := &schema.Func{Name: k.name, Schema: info.s, Body: info.body, Lang: info.lang, Args: funcArgs}
+			if info.retType != "" {
+				if t, err := ParseType(info.retType); err == nil {
+					f.Ret = t
+				} else {
+					f.Ret = &schema.UnsupportedType{T: info.retType}
+				}
+			}
+			info.s.Funcs = append(info.s.Funcs, f)
+		case "PROCEDURE":
+			p := &schema.Proc{Name: k.name, Schema: info.s, Body: info.body, Lang: info.lang, Args: funcArgs}
+			info.s.Procs = append(info.s.Procs, p)
+		}
+	}
+	return nil
+}
+
+// inspectPartitions queries and attaches partition info to tables in the given schema.
+func (i *inspect) inspectPartitions(ctx context.Context, s *schema.Schema) error {
+	if len(s.Tables) == 0 {
+		return nil
+	}
+	args := make([]any, 0, 1+len(s.Tables))
+	args = append(args, s.Name)
+	for _, t := range s.Tables {
+		args = append(args, t.Name)
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(partitionsQuery, nArgs(len(s.Tables))), args...)
+	if err != nil {
+		return fmt.Errorf("mysql: querying partitions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tableName, method, expr string
+		if err := rows.Scan(&tableName, &method, &expr); err != nil {
+			return fmt.Errorf("mysql: scanning partition: %w", err)
+		}
+		t, ok := s.Table(tableName)
+		if !ok {
+			continue
+		}
+		if !sqlx.Has(t.Attrs, &Partition{}) {
+			t.Attrs = append(t.Attrs, &Partition{T: method, Expr: expr})
+		}
+	}
+	return rows.Err()
+}
+
+// buildTriggerBody constructs the full CREATE TRIGGER statement from
+// the fields returned by INFORMATION_SCHEMA.TRIGGERS.
+func buildTriggerBody(name, table, timing, event, stmt string) string {
+	return fmt.Sprintf("CREATE TRIGGER `%s` %s %s ON `%s` FOR EACH ROW %s",
+		name, strings.ToUpper(timing), strings.ToUpper(event), table, stmt)
+}
 
 type (
 	// AutoIncrement attribute for columns with "AUTO_INCREMENT" as a default.
@@ -886,6 +1238,14 @@ type (
 	NetworkType struct {
 		schema.Type
 		T string
+	}
+
+	// Partition defines the spec of a partitioned table.
+	// https://dev.mysql.com/doc/refman/8.0/en/partitioning-types.html
+	Partition struct {
+		schema.Attr
+		T    string // RANGE, LIST, HASH, KEY, LINEAR HASH, LINEAR KEY
+		Expr string // The partition expression, e.g. YEAR(created_at)
 	}
 
 	// putShow is an intermediate table attribute used

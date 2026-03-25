@@ -100,6 +100,32 @@ func (s *state) plan(changes []schema.Change) error {
 			err = s.modifyTable(c)
 		case *schema.RenameTable:
 			s.renameTable(c)
+		case *schema.AddView:
+			err = s.addView(c)
+		case *schema.DropView:
+			err = s.dropView(c)
+		case *schema.ModifyView:
+			err = s.modifyView(c)
+		case *schema.RenameView:
+			s.renameView(c)
+		case *schema.AddTrigger:
+			err = s.addTrigger(c)
+		case *schema.DropTrigger:
+			err = s.dropTrigger(c)
+		case *schema.ModifyTrigger:
+			err = s.modifyTrigger(c)
+		case *schema.AddFunc:
+			err = s.addFunc(c)
+		case *schema.DropFunc:
+			err = s.dropFunc(c)
+		case *schema.ModifyFunc:
+			err = s.modifyFunc(c)
+		case *schema.AddProc:
+			err = s.addProc(c)
+		case *schema.DropProc:
+			err = s.dropProc(c)
+		case *schema.ModifyProc:
+			err = s.modifyProc(c)
 		default:
 			err = fmt.Errorf("unsupported change %T", c)
 		}
@@ -108,6 +134,256 @@ func (s *state) plan(changes []schema.Change) error {
 		}
 	}
 	return nil
+}
+
+func (s *state) addView(add *schema.AddView) error {
+	v := add.V
+	b := s.Build("CREATE")
+	if sqlx.Has(add.Extra, &schema.IfNotExists{}) {
+		b.P("OR REPLACE")
+	}
+	b.P("VIEW").View(v).P("AS").P(v.Def)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  add,
+		Comment: fmt.Sprintf("create view %q", v.Name),
+		Reverse: s.Build("DROP VIEW").View(v).String(),
+	})
+	return nil
+}
+
+func (s *state) dropView(drop *schema.DropView) error {
+	v := drop.V
+	b := s.Build("DROP VIEW")
+	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
+		b.P("IF EXISTS")
+	}
+	b.View(v)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  drop,
+		Comment: fmt.Sprintf("drop view %q", v.Name),
+	})
+	return nil
+}
+
+func (s *state) modifyView(modify *schema.ModifyView) error {
+	// MySQL supports CREATE OR REPLACE VIEW for in-place modification.
+	v := modify.To
+	b := s.Build("CREATE OR REPLACE VIEW").View(v).P("AS").P(v.Def)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  modify,
+		Comment: fmt.Sprintf("modify view %q", v.Name),
+	})
+	return nil
+}
+
+func (s *state) renameView(rename *schema.RenameView) {
+	// MySQL does not have RENAME VIEW; use RENAME TABLE which works on views.
+	s.append(&migrate.Change{
+		Cmd:     s.Build("RENAME TABLE").View(rename.From).P("TO").View(rename.To).String(),
+		Source:  rename,
+		Comment: fmt.Sprintf("rename view %q to %q", rename.From.Name, rename.To.Name),
+		Reverse: s.Build("RENAME TABLE").View(rename.To).P("TO").View(rename.From).String(),
+	})
+}
+
+func (s *state) addTrigger(add *schema.AddTrigger) error {
+	t := add.T
+	s.append(&migrate.Change{
+		Cmd:     t.Body,
+		Source:  add,
+		Comment: fmt.Sprintf("create trigger %q", t.Name),
+		Reverse: s.Build("DROP TRIGGER IF EXISTS").Ident(t.Name).String(),
+	})
+	return nil
+}
+
+func (s *state) dropTrigger(drop *schema.DropTrigger) error {
+	t := drop.T
+	b := s.Build("DROP TRIGGER")
+	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
+		b.P("IF EXISTS")
+	}
+	b.Ident(t.Name)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  drop,
+		Comment: fmt.Sprintf("drop trigger %q", t.Name),
+	})
+	return nil
+}
+
+func (s *state) modifyTrigger(modify *schema.ModifyTrigger) error {
+	// MySQL does not support ALTER TRIGGER; drop and recreate.
+	t := modify.To
+	s.append(&migrate.Change{
+		Cmd:     s.Build("DROP TRIGGER IF EXISTS").Ident(modify.From.Name).String(),
+		Source:  modify,
+		Comment: fmt.Sprintf("drop trigger %q before modify", modify.From.Name),
+	})
+	s.append(&migrate.Change{
+		Cmd:     t.Body,
+		Source:  modify,
+		Comment: fmt.Sprintf("create trigger %q", t.Name),
+	})
+	return nil
+}
+
+func (s *state) addFunc(add *schema.AddFunc) error {
+	s.append(&migrate.Change{
+		Cmd:     buildMySQLFuncDDL(add.F),
+		Source:  add,
+		Comment: fmt.Sprintf("create function %q", add.F.Name),
+		Reverse: s.Build("DROP FUNCTION IF EXISTS").Func(add.F).String(),
+	})
+	return nil
+}
+
+func (s *state) dropFunc(drop *schema.DropFunc) error {
+	b := s.Build("DROP FUNCTION")
+	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
+		b.P("IF EXISTS")
+	}
+	b.Func(drop.F)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  drop,
+		Comment: fmt.Sprintf("drop function %q", drop.F.Name),
+	})
+	return nil
+}
+
+func (s *state) modifyFunc(modify *schema.ModifyFunc) error {
+	// MySQL does not support CREATE OR REPLACE FUNCTION; drop and recreate.
+	s.append(&migrate.Change{
+		Cmd:     s.Build("DROP FUNCTION IF EXISTS").Func(modify.From).String(),
+		Source:  modify,
+		Comment: fmt.Sprintf("drop function %q before modify", modify.From.Name),
+	})
+	s.append(&migrate.Change{
+		Cmd:     buildMySQLFuncDDL(modify.To),
+		Source:  modify,
+		Comment: fmt.Sprintf("create function %q", modify.To.Name),
+	})
+	return nil
+}
+
+func (s *state) addProc(add *schema.AddProc) error {
+	s.append(&migrate.Change{
+		Cmd:     buildMySQLProcDDL(add.P),
+		Source:  add,
+		Comment: fmt.Sprintf("create procedure %q", add.P.Name),
+		Reverse: s.Build("DROP PROCEDURE IF EXISTS").Proc(add.P).String(),
+	})
+	return nil
+}
+
+func (s *state) dropProc(drop *schema.DropProc) error {
+	b := s.Build("DROP PROCEDURE")
+	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
+		b.P("IF EXISTS")
+	}
+	b.Proc(drop.P)
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  drop,
+		Comment: fmt.Sprintf("drop procedure %q", drop.P.Name),
+	})
+	return nil
+}
+
+func (s *state) modifyProc(modify *schema.ModifyProc) error {
+	// MySQL does not support CREATE OR REPLACE PROCEDURE; drop and recreate.
+	s.append(&migrate.Change{
+		Cmd:     s.Build("DROP PROCEDURE IF EXISTS").Proc(modify.From).String(),
+		Source:  modify,
+		Comment: fmt.Sprintf("drop procedure %q before modify", modify.From.Name),
+	})
+	s.append(&migrate.Change{
+		Cmd:     buildMySQLProcDDL(modify.To),
+		Source:  modify,
+		Comment: fmt.Sprintf("create procedure %q", modify.To.Name),
+	})
+	return nil
+}
+
+// buildMySQLFuncDDL reconstructs a MySQL CREATE FUNCTION statement.
+func buildMySQLFuncDDL(f *schema.Func) string {
+	var b strings.Builder
+	b.WriteString("CREATE FUNCTION ")
+	if f.Schema != nil {
+		b.WriteString("`")
+		b.WriteString(f.Schema.Name)
+		b.WriteString("`.")
+	}
+	b.WriteString("`")
+	b.WriteString(f.Name)
+	b.WriteString("`(")
+	for i, a := range f.Args {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if a.Name != "" {
+			b.WriteString("`")
+			b.WriteString(a.Name)
+			b.WriteString("` ")
+		}
+		if a.Type != nil {
+			if s, err := FormatType(a.Type); err == nil {
+				b.WriteString(s)
+			}
+		}
+	}
+	b.WriteString(")")
+	if f.Ret != nil {
+		b.WriteString(" RETURNS ")
+		if u, ok := f.Ret.(*schema.UnsupportedType); ok {
+			b.WriteString(u.T)
+		} else if s, err := FormatType(f.Ret); err == nil {
+			b.WriteString(s)
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(f.Body)
+	return b.String()
+}
+
+// buildMySQLProcDDL reconstructs a MySQL CREATE PROCEDURE statement.
+func buildMySQLProcDDL(p *schema.Proc) string {
+	var b strings.Builder
+	b.WriteString("CREATE PROCEDURE ")
+	if p.Schema != nil {
+		b.WriteString("`")
+		b.WriteString(p.Schema.Name)
+		b.WriteString("`.")
+	}
+	b.WriteString("`")
+	b.WriteString(p.Name)
+	b.WriteString("`(")
+	for i, a := range p.Args {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if a.Mode != "" && a.Mode != schema.FuncArgModeIn {
+			b.WriteString(string(a.Mode))
+			b.WriteString(" ")
+		}
+		if a.Name != "" {
+			b.WriteString("`")
+			b.WriteString(a.Name)
+			b.WriteString("` ")
+		}
+		if a.Type != nil {
+			if s, err := FormatType(a.Type); err == nil {
+				b.WriteString(s)
+			}
+		}
+	}
+	b.WriteString(")\n")
+	b.WriteString(p.Body)
+	return b.String()
 }
 
 // topLevel appends first the changes for creating or dropping schemas (top-level schema elements).

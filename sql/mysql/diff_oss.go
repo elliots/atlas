@@ -738,3 +738,57 @@ func (d *diff) defaultCharset(attrs *[]schema.Attr) error {
 func (*diff) ViewAttrChanges(_, _ *schema.View) []schema.Change {
 	return nil // Not implemented.
 }
+
+// ProcFuncsDiff implements the sqlx.ProcFuncsDiffer interface.
+func (*diff) ProcFuncsDiff(from, to *schema.Schema, _ *schema.DiffOptions) ([]schema.Change, error) {
+	var changes []schema.Change
+	for _, f1 := range from.Funcs {
+		f2 := findFunc(to.Funcs, f1)
+		if f2 == nil {
+			changes = append(changes, &schema.DropFunc{F: f1})
+			continue
+		}
+		if sqlx.BodyDefChanged(f1.Body, f2.Body) {
+			changes = append(changes, &schema.ModifyFunc{From: f1, To: f2})
+		}
+	}
+	for _, f1 := range to.Funcs {
+		if findFunc(from.Funcs, f1) == nil {
+			changes = append(changes, &schema.AddFunc{F: f1})
+		}
+	}
+	for _, p1 := range from.Procs {
+		p2 := findProc(to.Procs, p1)
+		if p2 == nil {
+			changes = append(changes, &schema.DropProc{P: p1})
+			continue
+		}
+		if sqlx.BodyDefChanged(p1.Body, p2.Body) {
+			changes = append(changes, &schema.ModifyProc{From: p1, To: p2})
+		}
+	}
+	for _, p1 := range to.Procs {
+		if findProc(from.Procs, p1) == nil {
+			changes = append(changes, &schema.AddProc{P: p1})
+		}
+	}
+	return changes, nil
+}
+
+func findFunc(funcs []*schema.Func, f *schema.Func) *schema.Func {
+	for _, fn := range funcs {
+		if fn.Name == f.Name {
+			return fn
+		}
+	}
+	return nil
+}
+
+func findProc(procs []*schema.Proc, p *schema.Proc) *schema.Proc {
+	for _, pr := range procs {
+		if pr.Name == p.Name {
+			return pr
+		}
+	}
+	return nil
+}

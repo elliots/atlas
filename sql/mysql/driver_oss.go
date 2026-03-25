@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"ariga.io/atlas/sql/internal/specutil"
 	"ariga.io/atlas/sql/internal/sqlx"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/mysql/internal/mysqlversion"
@@ -490,12 +491,26 @@ func (*inspect) tablesQueryArgs(context.Context) string {
 	return tablesQueryArgs
 }
 
-func viewSpec(*schema.View) (*sqlspec.View, error) {
-	return nil, nil // unimplemented.
+func viewSpec(view *schema.View) (*sqlspec.View, error) {
+	return specutil.FromView(
+		view,
+		func(c *schema.Column, _ *schema.View) (*sqlspec.Column, error) {
+			return specutil.FromColumn(c, columnTypeSpec)
+		},
+		indexSpec,
+	)
 }
 
-func convertView(*sqlspec.View, *schema.Schema) (*schema.View, error) {
-	return nil, nil // unimplemented.
+func convertView(spec *sqlspec.View, parent *schema.Schema) (*schema.View, error) {
+	return specutil.View(
+		spec, parent,
+		func(c *sqlspec.Column, _ *schema.View) (*schema.Column, error) {
+			return specutil.Column(c, convertColumnType)
+		},
+		func(i *sqlspec.Index, v *schema.View) (*schema.Index, error) {
+			return nil, fmt.Errorf("mysql: unexpected index %q on view %q", i.Name, v.Name)
+		},
+	)
 }
 
 func verifyChanges(context.Context, []schema.Change) error {

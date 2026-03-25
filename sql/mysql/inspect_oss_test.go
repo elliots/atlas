@@ -8,6 +8,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"testing"
 
@@ -563,15 +564,6 @@ func TestDriver_InspectTable(t *testing.T) {
 +--------------+--------------+-------------+------------+--------------+--------------+---------+--------------+------------+------------------+
 `))
 				m.noFKs()
-				m.ExpectQuery(sqltest.Escape("SHOW CREATE TABLE `public`.`users`")).
-					WillReturnRows(sqltest.Rows(`
-+-------+---------------------------------------------------------------------------------------------------------------------------------------------+
-| Table | Create Table                                                                                                                                |
-+-------+---------------------------------------------------------------------------------------------------------------------------------------------+
-+-------+---------------------------------------------------------------------------------------------------------------------------------------------+
-| users | CREATE TABLE users (id bigint NOT NULL AUTO_INCREMENT) ENGINE=InnoDB AUTO_INCREMENT=55834574848 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin |
-+-------+---------------------------------------------------------------------------------------------------------------------------------------------+
-`))
 			},
 			expect: func(require *require.Assertions, t *schema.Table, err error) {
 				require.NoError(err)
@@ -718,14 +710,6 @@ func TestDriver_InspectTable(t *testing.T) {
 | users             | users_chk_5       | (c1 <> _latin1\'\\\\\\\\\\\'\\\'\')       |  YES       |
 +-------------------+-------------------+-------------------------------------------+------------+
 `))
-				m.ExpectQuery(sqltest.Escape("SHOW CREATE TABLE `public`.`users`")).
-					WillReturnRows(sqltest.Rows(`
-+-------+------------------------+
-| Table | Create Table           |
-+-------+------------------------+
-| users | CREATE TABLE users()   |
-+-------+------------------------+
-`))
 			},
 			expect: func(require *require.Assertions, t *schema.Table, err error) {
 				require.NoError(err)
@@ -765,6 +749,9 @@ func TestDriver_InspectTable(t *testing.T) {
 +-------------+----------------------------+------------------------+
 				`))
 			tt.before(mk)
+			mk.noPartitions("public", "users")
+			mk.noFuncs("public")
+			mk.noTriggers("public")
 			drv, err := Open(db)
 			require.NoError(t, err)
 			s, err := drv.InspectSchema(context.Background(), "public", &schema.InspectOptions{
@@ -797,6 +784,8 @@ func TestDriver_InspectSchema(t *testing.T) {
 +-------------+----------------------------+------------------------+
 				`))
 				m.tables("public")
+				m.noFuncs("public")
+				m.noTriggers("public")
 			},
 			expect: func(require *require.Assertions, s *schema.Schema, err error) {
 				require.NoError(err)
@@ -864,6 +853,9 @@ func TestDriver_InspectSchema(t *testing.T) {
 | owner_id         | pets       | owner_id    | public       | users                 | id                     | public                 | NO ACTION   | CASCADE     |
 +------------------+------------+-------------+--------------+-----------------------+------------------------+------------------------+-------------+-------------+
 				`))
+				m.noPartitions("public", "users", "pets")
+				m.noFuncs("public")
+				m.noTriggers("public")
 			},
 			expect: func(require *require.Assertions, s *schema.Schema, err error) {
 				require.NoError(err)
@@ -927,6 +919,15 @@ func TestDriver_Realm(t *testing.T) {
 +-------------+----------------------------+------------------------+
 `))
 	mk.tables("test")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(routinesQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqlmock.NewRows([]string{"ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "ROUTINE_DEFINITION", "EXTERNAL_LANGUAGE", "DTD_IDENTIFIER"}))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(parametersQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqlmock.NewRows([]string{"SPECIFIC_SCHEMA", "SPECIFIC_NAME", "ORDINAL_POSITION", "PARAMETER_MODE", "PARAMETER_NAME", "DTD_IDENTIFIER"}))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(triggersQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqlmock.NewRows([]string{"TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_OBJECT_TABLE", "ACTION_TIMING", "EVENT_MANIPULATION", "ACTION_STATEMENT"}))
 	drv, err := Open(db)
 	require.NoError(t, err)
 	realm, err := drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
@@ -971,6 +972,15 @@ func TestDriver_Realm(t *testing.T) {
 	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "?, ?"))).
 		WithArgs("test", "public").
 		WillReturnRows(sqlmock.NewRows([]string{"schema", "table", "charset", "collate", "inc", "comment", "options"}))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(routinesQuery, "?, ?"))).
+		WithArgs("test", "public").
+		WillReturnRows(sqlmock.NewRows([]string{"ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "ROUTINE_DEFINITION", "EXTERNAL_LANGUAGE", "DTD_IDENTIFIER"}))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(parametersQuery, "?, ?"))).
+		WithArgs("test", "public").
+		WillReturnRows(sqlmock.NewRows([]string{"SPECIFIC_SCHEMA", "SPECIFIC_NAME", "ORDINAL_POSITION", "PARAMETER_MODE", "PARAMETER_NAME", "DTD_IDENTIFIER"}))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(triggersQuery, "?, ?"))).
+		WithArgs("test", "public").
+		WillReturnRows(sqlmock.NewRows([]string{"TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_OBJECT_TABLE", "ACTION_TIMING", "EVENT_MANIPULATION", "ACTION_STATEMENT"}))
 	realm, err = drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Mode:    ^schema.InspectViews,
 		Schemas: []string{"test", "public"},
@@ -1089,6 +1099,32 @@ func (m mock) noFKs() {
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME", "CONSTRAINT_NAME", "TABLE_NAME", "COLUMN_NAME", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME", "REFERENCED_TABLE_SCHEMA", "UPDATE_RULE", "DELETE_RULE"}))
 }
 
+func (m mock) noPartitions(s string, tables ...string) {
+	args := make([]driver.Value, 1+len(tables))
+	args[0] = s
+	for i, t := range tables {
+		args[i+1] = t
+	}
+	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(partitionsQuery, nArgs(len(tables))))).
+		WithArgs(args...).
+		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME", "PARTITION_METHOD", "PARTITION_EXPRESSION"}))
+}
+
+func (m mock) noFuncs(s string) {
+	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(routinesQuery, "?"))).
+		WithArgs(s).
+		WillReturnRows(sqlmock.NewRows([]string{"ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "ROUTINE_DEFINITION", "EXTERNAL_LANGUAGE", "DTD_IDENTIFIER"}))
+	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(parametersQuery, "?"))).
+		WithArgs(s).
+		WillReturnRows(sqlmock.NewRows([]string{"SPECIFIC_SCHEMA", "SPECIFIC_NAME", "ORDINAL_POSITION", "PARAMETER_MODE", "PARAMETER_NAME", "DTD_IDENTIFIER"}))
+}
+
+func (m mock) noTriggers(s string) {
+	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(triggersQuery, "?"))).
+		WithArgs(s).
+		WillReturnRows(sqlmock.NewRows([]string{"TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_OBJECT_TABLE", "ACTION_TIMING", "EVENT_MANIPULATION", "ACTION_STATEMENT"}))
+}
+
 func (m mock) tableExists(schema, table string, exists bool) {
 	rows := sqlmock.NewRows([]string{"table_schema", "table_name", "table_collation", "character_set", "auto_increment", "table_comment", "create_options", "engine", "default_engine", "table_type"})
 	if exists {
@@ -1107,4 +1143,206 @@ func (m mock) tables(schema string, tables ...string) {
 	m.ExpectQuery(queryTable).
 		WithArgs(schema).
 		WillReturnRows(rows)
+}
+
+func TestInspect_Views(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("8.0.13")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= ?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++-------------+----------------------------+------------------------+
+| SCHEMA_NAME | DEFAULT_CHARACTER_SET_NAME | DEFAULT_COLLATION_NAME |
++-------------+----------------------------+------------------------+
+| test        | utf8mb4                    | utf8mb4_unicode_ci     |
++-------------+----------------------------+------------------------+
+`))
+	// InspectViews mode: query views.
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(viewsQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++-------------+------------+---------------------------------------------------+-------------+
+| TABLE_SCHEMA| TABLE_NAME | VIEW_DEFINITION                                   | CHECK_OPTION|
++-------------+------------+---------------------------------------------------+-------------+
+| test        | active_usr | SELECT id FROM users WHERE active = 1             | NONE        |
+| test        | local_v    | SELECT id FROM users                              | LOCAL       |
++-------------+------------+---------------------------------------------------+-------------+
+`))
+	drv, err := Open(db)
+	require.NoError(t, err)
+	s, err := drv.InspectSchema(context.Background(), "test", &schema.InspectOptions{
+		Mode: schema.InspectViews,
+	})
+	require.NoError(t, err)
+	require.Len(t, s.Views, 2)
+	require.Equal(t, "active_usr", s.Views[0].Name)
+	require.Equal(t, "SELECT id FROM users WHERE active = 1", s.Views[0].Def)
+	require.Equal(t, "local_v", s.Views[1].Name)
+	var co schema.ViewCheckOption
+	require.True(t, sqlx.Has(s.Views[1].Attrs, &co))
+	require.Equal(t, schema.ViewCheckOptionLocal, co.V)
+}
+
+func TestInspect_Funcs(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("8.0.13")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= ?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++-------------+----------------------------+------------------------+
+| SCHEMA_NAME | DEFAULT_CHARACTER_SET_NAME | DEFAULT_COLLATION_NAME |
++-------------+----------------------------+------------------------+
+| test        | utf8mb4                    | utf8mb4_unicode_ci     |
++-------------+----------------------------+------------------------+
+`))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(routinesQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++----------------+--------------+--------------+------------------------------+-------------------+----------------+
+| ROUTINE_SCHEMA | ROUTINE_NAME | ROUTINE_TYPE | ROUTINE_DEFINITION           | EXTERNAL_LANGUAGE | DTD_IDENTIFIER |
++----------------+--------------+--------------+------------------------------+-------------------+----------------+
+| test           | add_nums     | FUNCTION     | BEGIN RETURN a + b; END      | SQL               | int            |
+| test           | do_work      | PROCEDURE    | BEGIN UPDATE t SET v=1; END  | SQL               |                |
++----------------+--------------+--------------+------------------------------+-------------------+----------------+
+`))
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(parametersQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++----------------+---------------+------------------+----------------+----------------+----------------+
+| SPECIFIC_SCHEMA| SPECIFIC_NAME | ORDINAL_POSITION | PARAMETER_MODE | PARAMETER_NAME | DTD_IDENTIFIER |
++----------------+---------------+------------------+----------------+----------------+----------------+
+| test           | add_nums      | 1                | IN             | a              | int            |
+| test           | add_nums      | 2                | IN             | b              | int            |
+| test           | do_work       | 1                | IN             | p1             | varchar(255)   |
++----------------+---------------+------------------+----------------+----------------+----------------+
+`))
+	drv, err := Open(db)
+	require.NoError(t, err)
+	s, err := drv.InspectSchema(context.Background(), "test", &schema.InspectOptions{
+		Mode: schema.InspectFuncs,
+	})
+	require.NoError(t, err)
+	require.Len(t, s.Funcs, 1)
+	f := s.Funcs[0]
+	require.Equal(t, "add_nums", f.Name)
+	require.Equal(t, "BEGIN RETURN a + b; END", f.Body)
+	require.Len(t, f.Args, 2)
+	require.Equal(t, "a", f.Args[0].Name)
+	require.Equal(t, schema.FuncArgModeIn, f.Args[0].Mode)
+	require.Len(t, s.Procs, 1)
+	p := s.Procs[0]
+	require.Equal(t, "do_work", p.Name)
+	require.Equal(t, "BEGIN UPDATE t SET v=1; END", p.Body)
+	require.Len(t, p.Args, 1)
+	require.Equal(t, "p1", p.Args[0].Name)
+}
+
+func TestInspect_Triggers(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("8.0.13")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= ?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++-------------+----------------------------+------------------------+
+| SCHEMA_NAME | DEFAULT_CHARACTER_SET_NAME | DEFAULT_COLLATION_NAME |
++-------------+----------------------------+------------------------+
+| test        | utf8mb4                    | utf8mb4_unicode_ci     |
++-------------+----------------------------+------------------------+
+`))
+	mk.tables("test", "users")
+	mk.ExpectQuery(queryColumns).
+		WithArgs("test", "users").
+		WillReturnRows(sqltest.Rows(`
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+| TABLE_NAME | COLUMN_NAME | COLUMN_TYPE | COLUMN_COMMENT | IS_NULLABLE | COLUMN_KEY | COLUMN_DEFAULT | EXTRA | CHARACTER_SET_NAME | COLLATION_NAME | GENERATION_EXPRESSION     |
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+| users      | id          | int         |                | NO          | PRI        | NULL           |       | NULL               | NULL           | NULL                      |
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+`))
+	mk.noIndexes()
+	mk.noFKs()
+	mk.noPartitions("test", "users")
+	mk.noFuncs("test")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(triggersQuery, "?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++----------------+--------------+--------------------+---------------+--------------------+---------------------------------------+
+| TRIGGER_SCHEMA | TRIGGER_NAME | EVENT_OBJECT_TABLE | ACTION_TIMING | EVENT_MANIPULATION | ACTION_STATEMENT                      |
++----------------+--------------+--------------------+---------------+--------------------+---------------------------------------+
+| test           | before_ins   | users              | BEFORE        | INSERT             | BEGIN SET NEW.created_at = NOW(); END |
++----------------+--------------+--------------------+---------------+--------------------+---------------------------------------+
+`))
+	drv, err := Open(db)
+	require.NoError(t, err)
+	s, err := drv.InspectSchema(context.Background(), "test", &schema.InspectOptions{
+		Mode: schema.InspectTables | schema.InspectFuncs | schema.InspectTriggers,
+	})
+	require.NoError(t, err)
+	require.Len(t, s.Tables, 1)
+	tbl := s.Tables[0]
+	require.Len(t, tbl.Triggers, 1)
+	tr := tbl.Triggers[0]
+	require.Equal(t, "before_ins", tr.Name)
+	require.Equal(t, schema.TriggerTimeBefore, tr.ActionTime)
+	require.Equal(t, []schema.TriggerEvent{schema.TriggerEventInsert}, tr.Events)
+	require.Equal(t, schema.TriggerForRow, tr.For)
+	require.Contains(t, tr.Body, "CREATE TRIGGER")
+}
+
+func TestInspect_Partitions(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("8.0.13")
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= ?"))).
+		WithArgs("test").
+		WillReturnRows(sqltest.Rows(`
++-------------+----------------------------+------------------------+
+| SCHEMA_NAME | DEFAULT_CHARACTER_SET_NAME | DEFAULT_COLLATION_NAME |
++-------------+----------------------------+------------------------+
+| test        | utf8mb4                    | utf8mb4_unicode_ci     |
++-------------+----------------------------+------------------------+
+`))
+	mk.tables("test", "orders")
+	mk.ExpectQuery(queryColumns).
+		WithArgs("test", "orders").
+		WillReturnRows(sqltest.Rows(`
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+| TABLE_NAME | COLUMN_NAME | COLUMN_TYPE | COLUMN_COMMENT | IS_NULLABLE | COLUMN_KEY | COLUMN_DEFAULT | EXTRA | CHARACTER_SET_NAME | COLLATION_NAME | GENERATION_EXPRESSION     |
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+| orders     | id          | int         |                | NO          | PRI        | NULL           |       | NULL               | NULL           | NULL                      |
++------------+-------------+-------------+----------------+-------------+------------+----------------+-------+--------------------+----------------+---------------------------+
+`))
+	mk.noIndexes()
+	mk.noFKs()
+	// Partition data.
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(partitionsQuery, "?"))).
+		WithArgs("test", "orders").
+		WillReturnRows(sqltest.Rows(`
++------------+------------------+----------------------+
+| TABLE_NAME | PARTITION_METHOD | PARTITION_EXPRESSION |
++------------+------------------+----------------------+
+| orders     | RANGE            | YEAR(created_at)     |
++------------+------------------+----------------------+
+`))
+	mk.noFuncs("test")
+	mk.noTriggers("test")
+	drv, err := Open(db)
+	require.NoError(t, err)
+	s, err := drv.InspectSchema(context.Background(), "test", &schema.InspectOptions{
+		Mode: ^schema.InspectViews,
+	})
+	require.NoError(t, err)
+	require.Len(t, s.Tables, 1)
+	tbl := s.Tables[0]
+	var p Partition
+	require.True(t, sqlx.Has(tbl.Attrs, &p))
+	require.Equal(t, "RANGE", p.T)
+	require.Equal(t, "YEAR(created_at)", p.Expr)
 }
