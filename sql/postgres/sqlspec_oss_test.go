@@ -2654,3 +2654,236 @@ schema "public" {
 	require.Equal(t, []string{"DROP TABLE", "DROP INDEX"}, et.Tags)
 	require.Equal(t, "abort_any_command", et.FuncRef)
 }
+
+func TestMarshalSpec_Role(t *testing.T) {
+	r := schema.NewRealm(schema.New("public"))
+	r.Objects = append(r.Objects,
+		&Role{
+			Name:      "app_user",
+			Inherit:   true,
+			ConnLimit: -1,
+		},
+		&Role{
+			Name:      "app_admin",
+			Login:     true,
+			CreateDB:  true,
+			Inherit:   true,
+			ConnLimit: -1,
+		},
+		&Role{
+			Name:        "superadmin",
+			Superuser:   true,
+			CreateDB:    true,
+			CreateRole:  true,
+			Login:       true,
+			Inherit:     true,
+			Replication: true,
+			BypassRLS:   true,
+			ConnLimit:   10,
+			MemberOf:    []string{"group1", "group2"},
+		},
+	)
+	got, err := MarshalHCL.MarshalSpec(r)
+	require.NoError(t, err)
+	require.Equal(t, `role "app_user" {
+}
+role "app_admin" {
+  create_db = true
+  login     = true
+}
+role "superadmin" {
+  superuser   = true
+  create_db   = true
+  create_role = true
+  login       = true
+  replication = true
+  bypass_rls  = true
+  conn_limit  = 10
+  member_of   = ["group1", "group2"]
+}
+schema "public" {
+}
+`, string(got))
+}
+
+func TestUnmarshalSpec_Role(t *testing.T) {
+	var r schema.Realm
+	require.NoError(t, EvalHCLBytes([]byte(`
+role "app_admin" {
+  login     = true
+  create_db = true
+}
+role "superadmin" {
+  superuser  = true
+  login      = true
+  inherit    = false
+  conn_limit = 5
+  member_of  = ["app_admin"]
+}
+schema "public" {
+}
+`), &r, nil))
+	var roles []*Role
+	for _, o := range r.Objects {
+		if rl, ok := o.(*Role); ok {
+			roles = append(roles, rl)
+		}
+	}
+	require.Len(t, roles, 2)
+	// app_admin
+	a := roles[0]
+	require.Equal(t, "app_admin", a.Name)
+	require.True(t, a.Login)
+	require.True(t, a.CreateDB)
+	require.True(t, a.Inherit)  // default
+	require.Equal(t, -1, a.ConnLimit) // default
+	// superadmin
+	s := roles[1]
+	require.Equal(t, "superadmin", s.Name)
+	require.True(t, s.Superuser)
+	require.True(t, s.Login)
+	require.False(t, s.Inherit)
+	require.Equal(t, 5, s.ConnLimit)
+	require.Equal(t, []string{"app_admin"}, s.MemberOf)
+}
+
+func TestUnsupportedBlocks(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		hcl  string
+		want string
+	}{
+		{"permission", `schema "public" {}
+permission { to = "admin" }`, `"permission" blocks are not supported`},
+		{"foreign_table", `schema "public" {}
+foreign_table "ft" { schema = schema.public }`, `"foreign_table" blocks are not supported`},
+		{"server", `schema "public" {}
+server "s" {}`, `"server" blocks are not supported`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var r schema.Realm
+			err := EvalHCLBytes([]byte(tt.hcl), &r, nil)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestMarshalSpec_RangeType(t *testing.T) {
+	s := schema.New("public").
+		AddObjects(
+			&RangeObj{
+				T:       "floatrange",
+				Schema:  schema.New("public"),
+				Subtype: &schema.FloatType{T: "float8"},
+			},
+		)
+	buf, err := MarshalHCL(s)
+	require.NoError(t, err)
+	require.Contains(t, string(buf), `range "floatrange"`)
+	require.Contains(t, string(buf), `subtype = float8`)
+}
+
+func TestUnmarshalSpec_RangeType(t *testing.T) {
+	f := `
+schema "public" {}
+
+range "floatrange" {
+  schema  = schema.public
+  subtype = float8
+}
+`
+	var s schema.Schema
+	require.NoError(t, EvalHCLBytes([]byte(f), &s, nil))
+	require.Len(t, s.Objects, 1)
+	ro, ok := s.Objects[0].(*RangeObj)
+	require.True(t, ok, "expected *RangeObj, got %T", s.Objects[0])
+	require.Equal(t, "floatrange", ro.T)
+	require.NotNil(t, ro.Subtype)
+}
+
+func TestMarshalSpec_Collation(t *testing.T) {
+	det := false
+	s := schema.New("public").
+		AddObjects(
+			&CollationObj{
+				T:        "mylocale",
+				Schema:   schema.New("public"),
+				Provider: "libc",
+				Locale:   "en-US",
+			},
+			&CollationObj{
+				T:             "case_insensitive",
+				Schema:        schema.New("public"),
+				Provider:      "icu",
+				Locale:        "und-u-ks-level2",
+				Deterministic: &det,
+			},
+		)
+	buf, err := MarshalHCL(s)
+	require.NoError(t, err)
+	out := string(buf)
+	require.Contains(t, out, `collation "mylocale"`)
+	require.Contains(t, out, `"libc"`)
+	require.Contains(t, out, `"en-US"`)
+	require.Contains(t, out, `collation "case_insensitive"`)
+	require.Contains(t, out, `"icu"`)
+	require.Contains(t, out, `deterministic = false`)
+}
+
+func TestUnmarshalSpec_Collation(t *testing.T) {
+	f := `
+schema "public" {}
+
+collation "mylocale" {
+  schema   = schema.public
+  provider = "libc"
+  locale   = "en-US"
+}
+
+collation "lc_coll" {
+  schema     = schema.public
+  lc_collate = "en_US.utf8"
+  lc_ctype   = "en_US.utf8"
+}
+`
+	var s schema.Schema
+	require.NoError(t, EvalHCLBytes([]byte(f), &s, nil))
+	require.Len(t, s.Objects, 2)
+
+	c0, ok := s.Objects[0].(*CollationObj)
+	require.True(t, ok, "expected *CollationObj, got %T", s.Objects[0])
+	require.Equal(t, "mylocale", c0.T)
+	require.Equal(t, "libc", c0.Provider)
+	require.Equal(t, "en-US", c0.Locale)
+	require.Nil(t, c0.Deterministic)
+
+	c1, ok := s.Objects[1].(*CollationObj)
+	require.True(t, ok, "expected *CollationObj, got %T", s.Objects[1])
+	require.Equal(t, "lc_coll", c1.T)
+	require.Equal(t, "en_US.utf8", c1.LcCollate)
+	require.Equal(t, "en_US.utf8", c1.LcCtype)
+}
+
+func TestUnmarshalSpec_Collation_Deterministic(t *testing.T) {
+	f := `
+schema "public" {}
+
+collation "case_insensitive" {
+  schema        = schema.public
+  provider      = "icu"
+  locale        = "und-u-ks-level2"
+  deterministic = false
+}
+`
+	var s schema.Schema
+	require.NoError(t, EvalHCLBytes([]byte(f), &s, nil))
+	require.Len(t, s.Objects, 1)
+	c, ok := s.Objects[0].(*CollationObj)
+	require.True(t, ok, "expected *CollationObj, got %T", s.Objects[0])
+	require.Equal(t, "case_insensitive", c.T)
+	require.Equal(t, "icu", c.Provider)
+	require.Equal(t, "und-u-ks-level2", c.Locale)
+	require.NotNil(t, c.Deterministic)
+	require.False(t, *c.Deterministic)
+}

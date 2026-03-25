@@ -706,6 +706,36 @@ func realmObjectsSpec(d *doc, r *schema.Realm) error {
 				})
 			}
 			d.EventTriggers = append(d.EventTriggers, spec)
+		case *Role:
+			spec := &role{Name: o.Name}
+			if o.Superuser {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("superuser", true))
+			}
+			if o.CreateDB {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("create_db", true))
+			}
+			if o.CreateRole {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("create_role", true))
+			}
+			if o.Login {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("login", true))
+			}
+			if !o.Inherit {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("inherit", false))
+			}
+			if o.Replication {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("replication", true))
+			}
+			if o.BypassRLS {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.BoolAttr("bypass_rls", true))
+			}
+			if o.ConnLimit != -1 {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.IntAttr("conn_limit", o.ConnLimit))
+			}
+			if len(o.MemberOf) > 0 {
+				spec.Extra.Attrs = append(spec.Extra.Attrs, schemahcl.StringsAttr("member_of", o.MemberOf...))
+			}
+			d.Roles = append(d.Roles, spec)
 		}
 	}
 	return nil
@@ -1548,8 +1578,8 @@ func (i *inspect) inspectTypes(ctx context.Context, r *schema.Realm, _ *schema.I
 	return rows2.Err()
 }
 
-// inspectObjects queries pg_sequences for independent sequences and attaches them to schemas.
-func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+// inspectObjects queries pg_sequences for independent sequences and collations, and attaches them to schemas.
+func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, opts *schema.InspectOptions) error {
 	args := make([]any, 0, len(r.Schemas))
 	for _, s := range r.Schemas {
 		args = append(args, s.Name)
@@ -1605,6 +1635,92 @@ func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, _ *schema
 			seq.Max = &v
 		}
 		s.Objects = append(s.Objects, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := i.inspectCollations(ctx, r, opts); err != nil {
+		return err
+	}
+	return i.inspectRangeTypes(ctx, r, opts)
+}
+
+// inspectCollations queries pg_collation for user-defined collations and attaches them to schemas.
+func (i *inspect) inspectCollations(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(collationsQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying collations: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			ns, name, provider, lcCollate, lcCtype string
+			deterministic                           bool
+		)
+		if err := rows.Scan(&ns, &name, &provider, &lcCollate, &lcCtype, &deterministic); err != nil {
+			return fmt.Errorf("postgres: scanning collation: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for collation %q not found", ns, name)
+		}
+		c := &CollationObj{
+			T:         name,
+			Schema:    s,
+			Provider:  provider,
+			LcCollate: lcCollate,
+			LcCtype:   lcCtype,
+		}
+		if !deterministic {
+			f := false
+			c.Deterministic = &f
+		}
+		s.Objects = append(s.Objects, c)
+	}
+	return rows.Err()
+}
+
+func (i *inspect) inspectRangeTypes(ctx context.Context, r *schema.Realm, _ *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(rangeTypesQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying range types: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ns, typName, subtype, subtypeDiff, multirangeName string
+		if err := rows.Scan(&ns, &typName, &subtype, &subtypeDiff, &multirangeName); err != nil {
+			return fmt.Errorf("postgres: scanning range type: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for range type %q not found", ns, typName)
+		}
+		st, err := ParseType(subtype)
+		if err != nil {
+			st = &schema.UnsupportedType{T: subtype}
+		}
+		ro := &RangeObj{
+			T:              typName,
+			Schema:         s,
+			Subtype:        st,
+			SubtypeDiff:    subtypeDiff,
+			MultirangeName: multirangeName,
+		}
+		s.Objects = append(s.Objects, ro)
 	}
 	return rows.Err()
 }
@@ -1741,7 +1857,60 @@ func (i *inspect) inspectRealmObjects(ctx context.Context, r *schema.Realm, _ *s
 		}
 		r.Objects = append(r.Objects, et)
 	}
-	return etRows.Err()
+	if err := etRows.Err(); err != nil {
+		return err
+	}
+	// Query roles (realm-scoped, not schema-scoped).
+	roleRows, err := i.QueryContext(ctx, rolesQuery)
+	if err != nil {
+		return fmt.Errorf("postgres: querying roles: %w", err)
+	}
+	defer roleRows.Close()
+	roles := make(map[string]*Role)
+	for roleRows.Next() {
+		var name string
+		var comment sql.NullString
+		var super, createDB, createRole, canLogin, inherit, replication, bypassRLS bool
+		var connLimit int
+		if err := roleRows.Scan(&name, &super, &createDB, &createRole, &canLogin, &inherit, &replication, &bypassRLS, &connLimit, &comment); err != nil {
+			return fmt.Errorf("postgres: scanning role: %w", err)
+		}
+		role := &Role{
+			Name:        name,
+			Superuser:   super,
+			CreateDB:    createDB,
+			CreateRole:  createRole,
+			Login:       canLogin,
+			Inherit:     inherit,
+			Replication: replication,
+			BypassRLS:   bypassRLS,
+			ConnLimit:   connLimit,
+		}
+		if comment.String != "" {
+			role.Attrs = append(role.Attrs, &schema.Comment{Text: comment.String})
+		}
+		roles[name] = role
+		r.Objects = append(r.Objects, role)
+	}
+	if err := roleRows.Err(); err != nil {
+		return err
+	}
+	// Query role memberships and attach to roles.
+	memberRows, err := i.QueryContext(ctx, roleMembersQuery)
+	if err != nil {
+		return fmt.Errorf("postgres: querying role members: %w", err)
+	}
+	defer memberRows.Close()
+	for memberRows.Next() {
+		var roleName, memberOf string
+		if err := memberRows.Scan(&roleName, &memberOf); err != nil {
+			return fmt.Errorf("postgres: scanning role member: %w", err)
+		}
+		if role, ok := roles[roleName]; ok {
+			role.MemberOf = append(role.MemberOf, memberOf)
+		}
+	}
+	return memberRows.Err()
 }
 
 // inspectPolicies queries pg_policies and attaches RLS policies to their tables.
@@ -1991,6 +2160,22 @@ func (s *state) addObject(add *schema.AddObject) error {
 			Reverse: drop,
 			Comment: fmt.Sprintf("create composite type %q", o.T),
 		})
+	case *CollationObj:
+		create, drop := s.createDropCollation(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create collation %q", o.T),
+		})
+	case *RangeObj:
+		create, drop := s.createDropRange(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create range type %q", o.T),
+		})
 	case *Extension:
 		s.append(&migrate.Change{
 			Source:  add,
@@ -2013,6 +2198,14 @@ func (s *state) addObject(add *schema.AddObject) error {
 			Cmd:     create,
 			Reverse: drop,
 			Comment: fmt.Sprintf("create event trigger %q", o.Name),
+		})
+	case *Role:
+		create, drop := s.createDropRole(o)
+		s.append(&migrate.Change{
+			Source:  add,
+			Cmd:     create,
+			Reverse: drop,
+			Comment: fmt.Sprintf("create role %q", o.Name),
 		})
 	}
 	return nil
@@ -2052,6 +2245,22 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 			Reverse: create,
 			Comment: fmt.Sprintf("drop composite type %q", o.T),
 		})
+	case *CollationObj:
+		create, dropCo := s.createDropCollation(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropCo,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop collation %q", o.T),
+		})
+	case *RangeObj:
+		create, dropR := s.createDropRange(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropR,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop range type %q", o.T),
+		})
 	case *Extension:
 		s.append(&migrate.Change{
 			Source:  drop,
@@ -2074,6 +2283,14 @@ func (s *state) dropObject(drop *schema.DropObject) error {
 			Cmd:     dropET,
 			Reverse: create,
 			Comment: fmt.Sprintf("drop event trigger %q", o.Name),
+		})
+	case *Role:
+		create, dropR := s.createDropRole(o)
+		s.append(&migrate.Change{
+			Source:  drop,
+			Cmd:     dropR,
+			Reverse: create,
+			Comment: fmt.Sprintf("drop role %q", o.Name),
 		})
 	}
 	return nil
@@ -2213,6 +2430,51 @@ func (s *state) createDropPolicy(p *Policy) (string, string) {
 	return create, drop.String()
 }
 
+// createDropRole returns CREATE and DROP statements for a database role.
+func (s *state) createDropRole(r *Role) (string, string) {
+	b := s.Build("CREATE ROLE")
+	b.Ident(r.Name)
+	var opts []string
+	if r.Superuser {
+		opts = append(opts, "SUPERUSER")
+	}
+	if r.CreateDB {
+		opts = append(opts, "CREATEDB")
+	}
+	if r.CreateRole {
+		opts = append(opts, "CREATEROLE")
+	}
+	if r.Login {
+		opts = append(opts, "LOGIN")
+	}
+	if !r.Inherit {
+		opts = append(opts, "NOINHERIT")
+	}
+	if r.Replication {
+		opts = append(opts, "REPLICATION")
+	}
+	if r.BypassRLS {
+		opts = append(opts, "BYPASSRLS")
+	}
+	if r.ConnLimit >= 0 {
+		opts = append(opts, fmt.Sprintf("CONNECTION LIMIT %d", r.ConnLimit))
+	}
+	if len(opts) > 0 {
+		b.P(strings.Join(opts, " "))
+	}
+	if len(r.MemberOf) > 0 {
+		b.P("IN ROLE")
+		for i, m := range r.MemberOf {
+			if i > 0 {
+				b.Comma()
+			}
+			b.Ident(m)
+		}
+	}
+	drop := s.Build("DROP ROLE IF EXISTS").Ident(r.Name).String()
+	return b.String(), drop
+}
+
 // createDropEventTrigger returns CREATE and DROP statements for an event trigger.
 func (s *state) createDropEventTrigger(et *EventTrigger) (string, string) {
 	b := s.Build("CREATE EVENT TRIGGER")
@@ -2247,6 +2509,49 @@ func (s *state) createDropComposite(c *CompositeType) (string, string) {
 	create := b.String()
 	drop := s.Build("DROP TYPE IF EXISTS").SchemaResource(c.Schema, c.T).String()
 	return create, drop
+}
+
+// createDropCollation returns CREATE and DROP statements for a collation.
+func (s *state) createDropCollation(c *CollationObj) (string, string) {
+	b := s.Build("CREATE COLLATION")
+	b.SchemaResource(c.Schema, c.T)
+	var parts []string
+	if c.Provider != "" {
+		parts = append(parts, "PROVIDER = "+c.Provider)
+	}
+	if c.Locale != "" {
+		parts = append(parts, "LOCALE = '"+c.Locale+"'")
+	}
+	if c.LcCollate != "" {
+		parts = append(parts, "LC_COLLATE = '"+c.LcCollate+"'")
+	}
+	if c.LcCtype != "" {
+		parts = append(parts, "LC_CTYPE = '"+c.LcCtype+"'")
+	}
+	if c.Deterministic != nil && !*c.Deterministic {
+		parts = append(parts, "DETERMINISTIC = false")
+	}
+	if len(parts) > 0 {
+		b.P("(" + strings.Join(parts, ", ") + ")")
+	}
+	create := b.String()
+	drop := s.Build("DROP COLLATION IF EXISTS").SchemaResource(c.Schema, c.T).String()
+	return create, drop
+}
+
+func (s *state) createDropRange(r *RangeObj) (string, string) {
+	b := s.Build("CREATE TYPE")
+	b.SchemaResource(r.Schema, r.T)
+	b.P("AS RANGE (SUBTYPE =", mustFormat(r.Subtype))
+	if r.SubtypeDiff != "" {
+		b.P(", SUBTYPE_DIFF =", r.SubtypeDiff)
+	}
+	if r.MultirangeName != "" {
+		b.P(", MULTIRANGE_TYPE_NAME =", r.MultirangeName)
+	}
+	b.P(")")
+	drop := s.Build("DROP TYPE IF EXISTS").SchemaResource(r.Schema, r.T).String()
+	return b.String(), drop
 }
 
 func (s *state) addTrigger(add *schema.AddTrigger) error {
@@ -2335,9 +2640,16 @@ func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
 			}); !ok {
 				changes = append(changes, &schema.DropObject{O: o1})
 			}
+		case *Role:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				r2, ok := o.(*Role)
+				return ok && v1.Name == r2.Name
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
 		}
 	}
-	// Add extensions and event triggers.
+	// Add extensions, event triggers, and roles.
 	for _, o1 := range to.Objects {
 		switch v1 := o1.(type) {
 		case *Extension:
@@ -2351,6 +2663,13 @@ func (*diff) RealmObjectDiff(from, to *schema.Realm) ([]schema.Change, error) {
 			if _, ok := from.Object(func(o schema.Object) bool {
 				et2, ok := o.(*EventTrigger)
 				return ok && v1.Name == et2.Name
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *Role:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				r2, ok := o.(*Role)
+				return ok && v1.Name == r2.Name
 			}); !ok {
 				changes = append(changes, &schema.AddObject{O: v1})
 			}
@@ -2389,6 +2708,20 @@ func (d *diff) SchemaObjectDiff(from, to *schema.Schema, opts *schema.DiffOption
 			if _, ok := to.Object(func(o schema.Object) bool {
 				c2, ok := o.(*CompositeType)
 				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
+		case *CollationObj:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				c2, ok := o.(*CollationObj)
+				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.DropObject{O: o1})
+			}
+		case *RangeObj:
+			if _, ok := to.Object(func(o schema.Object) bool {
+				r2, ok := o.(*RangeObj)
+				return ok && v1.T == r2.T
 			}); !ok {
 				changes = append(changes, &schema.DropObject{O: o1})
 			}
@@ -2435,6 +2768,20 @@ func (d *diff) SchemaObjectDiff(from, to *schema.Schema, opts *schema.DiffOption
 			if _, ok := from.Object(func(o schema.Object) bool {
 				c2, ok := o.(*CompositeType)
 				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *CollationObj:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				c2, ok := o.(*CollationObj)
+				return ok && v1.T == c2.T
+			}); !ok {
+				changes = append(changes, &schema.AddObject{O: v1})
+			}
+		case *RangeObj:
+			if _, ok := from.Object(func(o schema.Object) bool {
+				r2, ok := o.(*RangeObj)
+				return ok && v1.T == r2.T
 			}); !ok {
 				changes = append(changes, &schema.AddObject{O: v1})
 			}
@@ -2748,6 +3095,73 @@ func convertComposites(composites []*composite, r *schema.Realm) error {
 	return nil
 }
 
+// convertCollations converts collation HCL specs to CollationObj objects on the schema.
+func convertCollations(collations []*collation, r *schema.Realm) error {
+	for _, c := range collations {
+		ns, err := specutil.SchemaName(c.Schema)
+		if err != nil {
+			return fmt.Errorf("extract schema name from collation reference: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("schema %q defined on collation %q was not found in realm", ns, c.Name)
+		}
+		co := &CollationObj{T: c.Name, Schema: s}
+		if a, ok := c.Attr("provider"); ok {
+			co.Provider, _ = a.String()
+		}
+		if a, ok := c.Attr("locale"); ok {
+			co.Locale, _ = a.String()
+		}
+		if a, ok := c.Attr("lc_collate"); ok {
+			co.LcCollate, _ = a.String()
+		}
+		if a, ok := c.Attr("lc_ctype"); ok {
+			co.LcCtype, _ = a.String()
+		}
+		if a, ok := c.Attr("deterministic"); ok {
+			v, err := a.Bool()
+			if err == nil {
+				co.Deterministic = &v
+			}
+		}
+		s.AddObjects(co)
+	}
+	return nil
+}
+
+// convertRanges converts range HCL specs to RangeObj objects on the schema.
+func convertRanges(ranges []*rangeType, r *schema.Realm) error {
+	for _, rng := range ranges {
+		ns, err := specutil.SchemaName(rng.Schema)
+		if err != nil {
+			return fmt.Errorf("extract schema name from range reference: %w", err)
+		}
+		s, ok := r.Schema(ns)
+		if !ok {
+			return fmt.Errorf("schema %q defined on range %q was not found in realm", ns, rng.Name)
+		}
+		ro := &RangeObj{T: rng.Name, Schema: s}
+		if a, ok := rng.Attr("subtype"); ok {
+			typ, err := a.Type()
+			if err == nil {
+				t, err := TypeRegistry.Type(typ, nil)
+				if err == nil {
+					ro.Subtype = t
+				}
+			}
+		}
+		if a, ok := rng.Attr("subtype_diff"); ok {
+			ro.SubtypeDiff, _ = a.String()
+		}
+		if a, ok := rng.Attr("multirange_type_name"); ok {
+			ro.MultirangeName, _ = a.String()
+		}
+		s.AddObjects(ro)
+	}
+	return nil
+}
+
 // convertExtensions converts extension HCL specs to Extension objects on the realm.
 func convertExtensions(exs []*extension, r *schema.Realm) error {
 	for _, e := range exs {
@@ -2784,6 +3198,73 @@ func convertEventTriggers(evs []*eventTrigger, realm *schema.Realm) error {
 			}
 		}
 		realm.Objects = append(realm.Objects, et)
+	}
+	return nil
+}
+
+// convertRoles converts role HCL specs to Role realm objects.
+func convertRoles(roles []*role, realm *schema.Realm) error {
+	for _, r := range roles {
+		obj := &Role{Name: r.Name, ConnLimit: -1, Inherit: true}
+		if a, ok := r.Attr("superuser"); ok {
+			obj.Superuser, _ = a.Bool()
+		}
+		if a, ok := r.Attr("create_db"); ok {
+			obj.CreateDB, _ = a.Bool()
+		}
+		if a, ok := r.Attr("create_role"); ok {
+			obj.CreateRole, _ = a.Bool()
+		}
+		if a, ok := r.Attr("login"); ok {
+			obj.Login, _ = a.Bool()
+		}
+		if a, ok := r.Attr("inherit"); ok {
+			obj.Inherit, _ = a.Bool()
+		}
+		if a, ok := r.Attr("replication"); ok {
+			obj.Replication, _ = a.Bool()
+		}
+		if a, ok := r.Attr("bypass_rls"); ok {
+			obj.BypassRLS, _ = a.Bool()
+		}
+		if a, ok := r.Attr("conn_limit"); ok {
+			v, _ := a.Int()
+			obj.ConnLimit = v
+		}
+		if a, ok := r.Attr("member_of"); ok {
+			obj.MemberOf, _ = a.Strings()
+		}
+		realm.Objects = append(realm.Objects, obj)
+	}
+	return nil
+}
+
+// convertCasts converts cast HCL specs to Cast realm objects.
+func convertCasts(casts []*castSpec, realm *schema.Realm) error {
+	for _, c := range casts {
+		obj := &Cast{Context: "explicit"}
+		if a, ok := c.Attr("source"); ok {
+			obj.Source, _ = a.String()
+		}
+		if a, ok := c.Attr("target"); ok {
+			obj.Target, _ = a.String()
+		}
+		if a, ok := c.Attr("with"); ok {
+			v, _ := a.String()
+			if strings.EqualFold(v, "INOUT") {
+				obj.Method = "inout"
+			} else {
+				obj.Method = "function"
+				obj.FuncRef = v
+			}
+		} else {
+			obj.Method = "without"
+		}
+		if a, ok := c.Attr("as"); ok {
+			v, _ := a.String()
+			obj.Context = strings.ToLower(v)
+		}
+		realm.Objects = append(realm.Objects, obj)
 	}
 	return nil
 }
@@ -2908,6 +3389,46 @@ func objectSpec(d *doc, spec *specutil.SchemaSpec, s *schema.Schema) error {
 				ps.Extra.Attrs = append(ps.Extra.Attrs, schemahcl.StringAttr("with_check", o.Check))
 			}
 			d.Policies = append(d.Policies, ps)
+		case *CollationObj:
+			co := &collation{
+				Name:   o.T,
+				Schema: ref,
+			}
+			if o.Provider != "" {
+				co.Extra.Attrs = append(co.Extra.Attrs, schemahcl.StringAttr("provider", o.Provider))
+			}
+			if o.Locale != "" {
+				co.Extra.Attrs = append(co.Extra.Attrs, schemahcl.StringAttr("locale", o.Locale))
+			}
+			if o.LcCollate != "" {
+				co.Extra.Attrs = append(co.Extra.Attrs, schemahcl.StringAttr("lc_collate", o.LcCollate))
+			}
+			if o.LcCtype != "" {
+				co.Extra.Attrs = append(co.Extra.Attrs, schemahcl.StringAttr("lc_ctype", o.LcCtype))
+			}
+			if o.Deterministic != nil {
+				co.Extra.Attrs = append(co.Extra.Attrs, schemahcl.BoolAttr("deterministic", *o.Deterministic))
+			}
+			d.Collations = append(d.Collations, co)
+		case *RangeObj:
+			rs := &rangeType{
+				Name:   o.T,
+				Schema: ref,
+			}
+			if o.Subtype != nil {
+				c, err := columnTypeSpec(o.Subtype)
+				if err != nil {
+					return err
+				}
+				rs.Extra.Attrs = append(rs.Extra.Attrs, specutil.TypeAttr("subtype", c.Type))
+			}
+			if o.SubtypeDiff != "" {
+				rs.Extra.Attrs = append(rs.Extra.Attrs, schemahcl.StringAttr("subtype_diff", o.SubtypeDiff))
+			}
+			if o.MultirangeName != "" {
+				rs.Extra.Attrs = append(rs.Extra.Attrs, schemahcl.StringAttr("multirange_type_name", o.MultirangeName))
+			}
+			d.Ranges = append(d.Ranges, rs)
 		}
 	}
 	return nil
@@ -3227,6 +3748,36 @@ WHERE
 ORDER BY
 	n.nspname, c.relname
 `
+	// Query to list collations defined in the schemas.
+	collationsQuery = `
+SELECT
+	n.nspname AS schema_name,
+	c.collname AS collation_name,
+	CASE c.collprovider WHEN 'd' THEN 'libc' WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' WHEN 'b' THEN 'builtin' ELSE 'libc' END AS provider,
+	COALESCE(c.collcollate, '') AS lc_collate,
+	COALESCE(c.collctype, '') AS lc_ctype,
+	c.collisdeterministic AS deterministic
+FROM pg_catalog.pg_collation c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
+WHERE n.nspname IN (%s)
+ORDER BY n.nspname, c.collname
+`
+	// Query to list range types defined in the schemas.
+	rangeTypesQuery = `
+SELECT
+	n.nspname AS schema_name,
+	t.typname AS type_name,
+	format_type(r.rngsubtype, NULL) AS subtype,
+	COALESCE(p.proname, '') AS subtype_diff,
+	COALESCE(mt.typname, '') AS multirange_name
+FROM pg_catalog.pg_range r
+JOIN pg_catalog.pg_type t ON t.oid = r.rngtypid
+JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_catalog.pg_proc p ON p.oid = r.rngsubdiff
+LEFT JOIN pg_catalog.pg_type mt ON mt.oid = r.rngmultitypid
+WHERE n.nspname IN (%s)
+ORDER BY n.nspname, t.typname
+`
 	// Query to list extensions.
 	extensionsQuery = `
 SELECT
@@ -3271,5 +3822,34 @@ FROM
 	JOIN pg_catalog.pg_proc p ON p.oid = e.evtfoid
 ORDER BY
 	e.evtname
+`
+	// Query to list non-system roles (excludes pg_* roles and the postgres superuser).
+	rolesQuery = `
+SELECT
+    r.rolname,
+    r.rolsuper,
+    r.rolcreatedb,
+    r.rolcreaterole,
+    r.rolcanlogin,
+    r.rolinherit,
+    r.rolreplication,
+    r.rolbypassrls,
+    r.rolconnlimit,
+    pg_catalog.shobj_description(r.oid, 'pg_authid') AS comment
+FROM pg_catalog.pg_roles r
+WHERE r.rolname NOT LIKE 'pg_%'
+  AND r.rolname != 'postgres'
+ORDER BY r.rolname
+`
+	// Query to list role membership for non-system roles.
+	roleMembersQuery = `
+SELECT
+    r.rolname AS role_name,
+    m.rolname AS member_of
+FROM pg_catalog.pg_auth_members a
+JOIN pg_catalog.pg_roles r ON r.oid = a.member
+JOIN pg_catalog.pg_roles m ON m.oid = a.roleid
+WHERE r.rolname NOT LIKE 'pg_%'
+ORDER BY r.rolname, m.rolname
 `
 )

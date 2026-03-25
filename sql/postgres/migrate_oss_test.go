@@ -2383,6 +2383,255 @@ func TestPlanChanges(t *testing.T) {
 				},
 			},
 		},
+		// Role: add with no options (defaults: Inherit=true, ConnLimit=-1 are not emitted).
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Role{
+					Name:      "app_user",
+					Inherit:   true,
+					ConnLimit: -1,
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE ROLE "app_user"`,
+						Reverse: `DROP ROLE IF EXISTS "app_user"`,
+					},
+				},
+			},
+		},
+		// Role: add with login and createdb.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Role{
+					Name:      "app_admin",
+					Login:     true,
+					CreateDB:  true,
+					Inherit:   true,
+					ConnLimit: -1,
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE ROLE "app_admin" CREATEDB LOGIN`,
+						Reverse: `DROP ROLE IF EXISTS "app_admin"`,
+					},
+				},
+			},
+		},
+		// Role: add with all options including member_of.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Role{
+					Name:        "superadmin",
+					Superuser:   true,
+					CreateDB:    true,
+					CreateRole:  true,
+					Login:       true,
+					Inherit:     true,
+					Replication: true,
+					BypassRLS:   true,
+					ConnLimit:   10,
+					MemberOf:    []string{"group1", "group2"},
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE ROLE "superadmin" SUPERUSER CREATEDB CREATEROLE LOGIN REPLICATION BYPASSRLS CONNECTION LIMIT 10 IN ROLE "group1", "group2"`,
+						Reverse: `DROP ROLE IF EXISTS "superadmin"`,
+					},
+				},
+			},
+		},
+		// Role: add with noinherit (non-default inherit=false is emitted).
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Role{
+					Name:      "isolated",
+					Inherit:   false,
+					ConnLimit: -1,
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE ROLE "isolated" NOINHERIT`,
+						Reverse: `DROP ROLE IF EXISTS "isolated"`,
+					},
+				},
+			},
+		},
+		// Role: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropObject{O: &Role{
+					Name:      "old_role",
+					Inherit:   true,
+					ConnLimit: -1,
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `DROP ROLE IF EXISTS "old_role"`,
+						Reverse: `CREATE ROLE "old_role"`,
+					},
+				},
+			},
+		},
+		// Range type: create with subtype.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{
+					O: &RangeObj{
+						T:       "floatrange",
+						Schema:  schema.New("public"),
+						Subtype: &schema.FloatType{T: "float8"},
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE TYPE "public"."floatrange" AS RANGE (SUBTYPE = double precision )`,
+						Reverse: `DROP TYPE IF EXISTS "public"."floatrange"`,
+					},
+				},
+			},
+		},
+		// Range type: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropObject{
+					O: &RangeObj{
+						T:       "floatrange",
+						Schema:  schema.New("public"),
+						Subtype: &schema.FloatType{T: "float8"},
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `DROP TYPE IF EXISTS "public"."floatrange"`,
+						Reverse: `CREATE TYPE "public"."floatrange" AS RANGE (SUBTYPE = double precision )`,
+					},
+				},
+			},
+		},
+		// Collation: create with provider and locale.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{
+					O: &CollationObj{
+						T:        "mylocale",
+						Schema:   schema.New("public"),
+						Provider: "libc",
+						Locale:   "en-US",
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE COLLATION "public"."mylocale" (PROVIDER = libc, LOCALE = 'en-US')`,
+						Reverse: `DROP COLLATION IF EXISTS "public"."mylocale"`,
+					},
+				},
+			},
+		},
+		// Collation: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropObject{
+					O: &CollationObj{
+						T:        "mylocale",
+						Schema:   schema.New("public"),
+						Provider: "libc",
+						Locale:   "en-US",
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `DROP COLLATION IF EXISTS "public"."mylocale"`,
+						Reverse: `CREATE COLLATION "public"."mylocale" (PROVIDER = libc, LOCALE = 'en-US')`,
+					},
+				},
+			},
+		},
+		// Collation: create with lc_collate and lc_ctype.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{
+					O: &CollationObj{
+						T:         "lc_coll",
+						Schema:    schema.New("public"),
+						LcCollate: "en_US.utf8",
+						LcCtype:   "en_US.utf8",
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE COLLATION "public"."lc_coll" (LC_COLLATE = 'en_US.utf8', LC_CTYPE = 'en_US.utf8')`,
+						Reverse: `DROP COLLATION IF EXISTS "public"."lc_coll"`,
+					},
+				},
+			},
+		},
+		// Collation: create non-deterministic ICU collation.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{
+					O: func() *CollationObj {
+						det := false
+						return &CollationObj{
+							T:             "case_insensitive",
+							Schema:        schema.New("public"),
+							Provider:      "icu",
+							Locale:        "und-u-ks-level2",
+							Deterministic: &det,
+						}
+					}(),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE COLLATION "public"."case_insensitive" (PROVIDER = icu, LOCALE = 'und-u-ks-level2', DETERMINISTIC = false)`,
+						Reverse: `DROP COLLATION IF EXISTS "public"."case_insensitive"`,
+					},
+				},
+			},
+		},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {

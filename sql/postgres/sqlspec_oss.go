@@ -33,6 +33,7 @@ type (
 		Enums         []*enum             `spec:"enum"`
 		Domains       []*domain           `spec:"domain"`
 		Composites    []*composite        `spec:"composite"`
+		Collations    []*collation        `spec:"collation"`
 		Sequences     []*sqlspec.Sequence `spec:"sequence"`
 		Funcs         []*sqlspec.Func     `spec:"function"`
 		Procs         []*sqlspec.Func     `spec:"procedure"`
@@ -40,11 +41,21 @@ type (
 		Triggers      []*sqlspec.Trigger  `spec:"trigger"`
 		Policies      []*policy           `spec:"policy"`
 		EventTriggers []*eventTrigger     `spec:"event_trigger"`
+		Casts         []*castSpec         `spec:"cast"`
+		Roles         []*role             `spec:"role"`
+		Ranges        []*rangeType        `spec:"range"`
 		Extensions    []*extension        `spec:"extension"`
 		Schemas       []*sqlspec.Schema   `spec:"schema"`
+		Permissions   []*unsupported      `spec:"permission"`
+		ForeignTables []*unsupported      `spec:"foreign_table"`
+		Servers       []*unsupported      `spec:"server"`
 	}
 
-	// Enum holds a specification for an enum type.
+	unsupported struct {
+		Name string `spec:",name"`
+		schemahcl.DefaultExtension
+	}
+
 	enum struct {
 		Name      string         `spec:",name"`
 		Qualifier string         `spec:",qualifier"`
@@ -53,7 +64,6 @@ type (
 		schemahcl.DefaultExtension
 	}
 
-	// domain holds a specification for a domain type.
 	domain struct {
 		Name      string           `spec:",name"`
 		Qualifier string           `spec:",qualifier"`
@@ -65,7 +75,6 @@ type (
 		schemahcl.DefaultExtension
 	}
 
-	// composite holds a specification for a composite type.
 	composite struct {
 		Name      string            `spec:",name"`
 		Qualifier string            `spec:",qualifier"`
@@ -74,49 +83,57 @@ type (
 		schemahcl.DefaultExtension
 	}
 
-	// compositeField holds a specification for a field in a composite type.
-	// The extension might hold optional attributes such as collation.
 	compositeField struct {
 		Name string          `spec:",name"`
 		Type *schemahcl.Type `spec:"type"`
 		schemahcl.DefaultExtension
 	}
 
-	// extension holds a specification for a postgres extension.
-	// Note, extension names are unique within a realm (database).
 	extension struct {
 		Name string `spec:",name"`
-		// Schema, version and comment are conditionally
-		// added to the extension definition.
 		schemahcl.DefaultExtension
 	}
 
-	// eventTrigger holds a specification for a postgres event trigger.
-	// Note, event trigger names are unique within a realm (database).
 	eventTrigger struct {
 		Name string `spec:",name"`
-		// Schema, version and comment are conditionally
-		// added to the extension definition.
 		schemahcl.DefaultExtension
 	}
 
-	// aggregate holds the specification for an aggregation function.
+	castSpec struct {
+		Name string `spec:",name"`
+		schemahcl.DefaultExtension
+	}
+
+	role struct {
+		Name string `spec:",name"`
+		schemahcl.DefaultExtension
+	}
+
+	rangeType struct {
+		Name      string         `spec:",name"`
+		Qualifier string         `spec:",qualifier"`
+		Schema    *schemahcl.Ref `spec:"schema"`
+		schemahcl.DefaultExtension
+	}
+
+	collation struct {
+		Name      string         `spec:",name"`
+		Qualifier string         `spec:",qualifier"`
+		Schema    *schemahcl.Ref `spec:"schema"`
+		schemahcl.DefaultExtension
+	}
+
 	aggregate struct {
 		Name      string             `spec:",name"`
 		Qualifier string             `spec:",qualifier"`
 		Schema    *schemahcl.Ref     `spec:"schema"`
 		Args      []*sqlspec.FuncArg `spec:"arg"`
-		// state_type, state_func and rest of the attributes
-		// are appended after the function arguments.
 		schemahcl.DefaultExtension
 	}
 
-	// Policy defines row-level security policy for a table.
-	// See: https://www.postgresql.org/docs/current/view-pg-policies.html.
 	policy struct {
 		Name string         `spec:",name"`
 		On   *schemahcl.Ref `spec:"on"`
-		// Rest of the attributes are appended after the table reference.
 		schemahcl.DefaultExtension
 	}
 )
@@ -130,6 +147,7 @@ func (d *doc) merge(d1 *doc) {
 	d.Tables = append(d.Tables, d1.Tables...)
 	d.Domains = append(d.Domains, d1.Domains...)
 	d.Composites = append(d.Composites, d1.Composites...)
+	d.Collations = append(d.Collations, d1.Collations...)
 	d.Schemas = append(d.Schemas, d1.Schemas...)
 	d.Aggregates = append(d.Aggregates, d1.Aggregates...)
 	d.Sequences = append(d.Sequences, d1.Sequences...)
@@ -138,6 +156,26 @@ func (d *doc) merge(d1 *doc) {
 	d.Policies = append(d.Policies, d1.Policies...)
 	d.EventTriggers = append(d.EventTriggers, d1.EventTriggers...)
 	d.Materialized = append(d.Materialized, d1.Materialized...)
+	d.Casts = append(d.Casts, d1.Casts...)
+	d.Roles = append(d.Roles, d1.Roles...)
+	d.Ranges = append(d.Ranges, d1.Ranges...)
+	d.Permissions = append(d.Permissions, d1.Permissions...)
+	d.ForeignTables = append(d.ForeignTables, d1.ForeignTables...)
+	d.Servers = append(d.Servers, d1.Servers...)
+}
+
+// checkUnsupported returns an error if the doc contains blocks not supported by this driver version.
+func (d *doc) checkUnsupported() error {
+	switch {
+	case len(d.Permissions) > 0:
+		return fmt.Errorf("postgres: \"permission\" blocks are not supported by this version of the driver")
+	case len(d.ForeignTables) > 0:
+		return fmt.Errorf("postgres: \"foreign_table\" blocks are not supported by this version of the driver")
+	case len(d.Servers) > 0:
+		return fmt.Errorf("postgres: \"server\" blocks are not supported by this version of the driver")
+	default:
+		return nil
+	}
 }
 
 func (d *doc) ScanDoc() *specutil.ScanDoc {
@@ -188,6 +226,18 @@ func (c *composite) SetQualifier(q string) { c.Qualifier = q }
 // SchemaRef returns the schema reference for the composite.
 func (c *composite) SchemaRef() *schemahcl.Ref { return c.Schema }
 
+// Label returns the name label used for the collation resource.
+func (c *collation) Label() string { return c.Name }
+
+// QualifierLabel returns the qualifier label used for the collation resource, if any.
+func (c *collation) QualifierLabel() string { return c.Qualifier }
+
+// SetQualifier sets the qualifier label used for the collation resource.
+func (c *collation) SetQualifier(q string) { c.Qualifier = q }
+
+// SchemaRef returns the schema reference for the collation.
+func (c *collation) SchemaRef() *schemahcl.Ref { return c.Schema }
+
 // Label returns the defaults label used for the aggregate resource.
 func (a *aggregate) Label() string { return a.Name }
 
@@ -200,14 +250,33 @@ func (a *aggregate) SetQualifier(q string) { a.Qualifier = q }
 // SchemaRef returns the schema reference for the aggregate.
 func (a *aggregate) SchemaRef() *schemahcl.Ref { return a.Schema }
 
+// Label returns the name label used for the range resource.
+func (r *rangeType) Label() string { return r.Name }
+
+// QualifierLabel returns the qualifier label used for the range resource, if any.
+func (r *rangeType) QualifierLabel() string { return r.Qualifier }
+
+// SetQualifier sets the qualifier label used for the range resource.
+func (r *rangeType) SetQualifier(q string) { r.Qualifier = q }
+
+// SchemaRef returns the schema reference for the range.
+func (r *rangeType) SchemaRef() *schemahcl.Ref { return r.Schema }
+
 func init() {
 	schemahcl.Register("enum", &enum{})
 	schemahcl.Register("domain", &domain{})
 	schemahcl.Register("policy", &policy{})
 	schemahcl.Register("composite", &composite{})
+	schemahcl.Register("collation", &collation{})
 	schemahcl.Register("aggregate", &aggregate{})
 	schemahcl.Register("extension", &extension{})
 	schemahcl.Register("event_trigger", &eventTrigger{})
+	schemahcl.Register("role", &role{})
+	schemahcl.Register("cast", &castSpec{})
+	schemahcl.Register("range", &rangeType{})
+	schemahcl.Register("permission", &unsupported{})
+	schemahcl.Register("foreign_table", &unsupported{})
+	schemahcl.Register("server", &unsupported{})
 }
 
 // Codec for schemahcl.
@@ -228,6 +297,9 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		if err := c.State.EvalOptions(p, &d, opts); err != nil {
 			return err
 		}
+		if err := d.checkUnsupported(); err != nil {
+			return err
+		}
 		if err := specutil.Scan(v, d.ScanDoc(), scanFuncs); err != nil {
 			return fmt.Errorf("specutil: failed converting to *schema.Realm: %w", err)
 		}
@@ -238,6 +310,9 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 			return err
 		}
 		if err := convertComposites(d.Composites, v); err != nil {
+			return err
+		}
+		if err := convertCollations(d.Collations, v); err != nil {
 			return err
 		}
 		if err := convertAggregate(&d, v); err != nil {
@@ -255,12 +330,24 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		if err := convertEventTriggers(d.EventTriggers, v); err != nil {
 			return err
 		}
+		if err := convertRoles(d.Roles, v); err != nil {
+			return err
+		}
+		if err := convertCasts(d.Casts, v); err != nil {
+			return err
+		}
+		if err := convertRanges(d.Ranges, v); err != nil {
+			return err
+		}
 		if err := normalizeRealm(v); err != nil {
 			return err
 		}
 	case *schema.Schema:
 		var d doc
 		if err := c.State.EvalOptions(p, &d, opts); err != nil {
+			return err
+		}
+		if err := d.checkUnsupported(); err != nil {
 			return err
 		}
 		if len(d.Schemas) != 1 {
@@ -279,6 +366,12 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		if err := convertComposites(d.Composites, r); err != nil {
 			return err
 		}
+		if err := convertCollations(d.Collations, r); err != nil {
+			return err
+		}
+		if err := convertRanges(d.Ranges, r); err != nil {
+			return err
+		}
 		if err := convertAggregate(&d, r); err != nil {
 			return err
 		}
@@ -288,7 +381,7 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		if err := convertPolicies(d.Tables, d.Policies, r); err != nil {
 			return err
 		}
-		// Extensions are skipped in schema scope.
+		// Extensions, casts, roles are skipped in schema scope.
 		if err := normalizeRealm(r); err != nil {
 			return err
 		}
@@ -354,6 +447,9 @@ func (c *Codec) MarshalSpec(v any) ([]byte, error) {
 		if err := specutil.QualifyObjects(d.Composites); err != nil {
 			return nil, err
 		}
+		if err := specutil.QualifyObjects(d.Collations); err != nil {
+			return nil, err
+		}
 		if err := specutil.QualifyObjects(d.Sequences); err != nil {
 			return nil, err
 		}
@@ -387,6 +483,7 @@ var (
 			schemahcl.WithTypes("function.arg.type", TypeRegistry.Specs()),
 			schemahcl.WithTypes("function.return", TypeRegistry.Specs()),
 			schemahcl.WithTypes("procedure.arg.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("range.subtype", TypeRegistry.Specs()),
 			schemahcl.WithScopedEnums("view.check_option", schema.ViewCheckOptionLocal, schema.ViewCheckOptionCascaded),
 			schemahcl.WithScopedEnums("table.index.type", IndexTypeBTree, IndexTypeBRIN, IndexTypeHash, IndexTypeGIN, IndexTypeGiST, "GiST", IndexTypeSPGiST, "SPGiST"),
 			schemahcl.WithScopedEnums("table.partition.type", PartitionTypeRange, PartitionTypeList, PartitionTypeHash),
@@ -802,6 +899,7 @@ func schemaSpec(s *schema.Schema) (*doc, []*schema.Trigger, error) {
 		Enums:        make([]*enum, 0, len(s.Objects)),
 		Domains:      make([]*domain, 0, len(s.Objects)),
 		Composites:   make([]*composite, 0, len(s.Objects)),
+		Collations:   make([]*collation, 0, len(s.Objects)),
 	}
 	if err := objectSpec(d, spec, s); err != nil {
 		return nil, nil, err

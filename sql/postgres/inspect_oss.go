@@ -995,6 +995,22 @@ type (
 		Deps   []schema.Object  // Objects this domain depends on.
 	}
 
+	// CollationObj defines a collation as a schema object.
+	// https://www.postgresql.org/docs/current/sql-createcollation.html
+	CollationObj struct {
+		schema.Object
+		T             string         // Collation name.
+		Schema        *schema.Schema // Schema where defined.
+		Locale        string         // LOCALE value.
+		Provider      string         // "icu", "libc", or "builtin".
+		Deterministic *bool          // DETERMINISTIC flag (nil = default true).
+		LcCollate     string         // LC_COLLATE value.
+		LcCtype       string         // LC_CTYPE value.
+		Version       string         // Collation version.
+		Attrs         []schema.Attr
+		Deps          []schema.Object
+	}
+
 	// IntervalType defines an interval type.
 	// https://postgresql.org/docs/current/datatype-datetime.html
 	IntervalType struct {
@@ -1151,6 +1167,48 @@ type (
 		Deps    []schema.Object
 	}
 
+	// Cast defines a type cast.
+	Cast struct {
+		schema.Object
+		Source  string
+		Target  string
+		Method  string
+		FuncRef string
+		Context string
+		Attrs   []schema.Attr
+		Deps    []schema.Object
+	}
+
+	// RangeObj defines a range type as a schema object.
+	RangeObj struct {
+		schema.Type
+		schema.Object
+		T              string
+		Schema         *schema.Schema
+		Subtype        schema.Type
+		SubtypeDiff    string
+		MultirangeName string
+		Attrs          []schema.Attr
+		Deps           []schema.Object
+	}
+
+	// Role defines a database role.
+	Role struct {
+		schema.Object
+		Name        string
+		Superuser   bool
+		CreateDB    bool
+		CreateRole  bool
+		Login       bool
+		Inherit     bool
+		Replication bool
+		BypassRLS   bool
+		ConnLimit   int
+		MemberOf    []string
+		Attrs       []schema.Attr
+		Deps        []schema.Object
+	}
+
 	// Identity defines an identity column.
 	Identity struct {
 		schema.Attr
@@ -1305,6 +1363,26 @@ func (c *CompositeType) SpecType() string {
 // SpecName returns the name of the composite type.
 func (c *CompositeType) SpecName() string {
 	return c.T
+}
+
+// SpecType returns the HCL block type for a collation object.
+func (c *CollationObj) SpecType() string {
+	return "collation"
+}
+
+// SpecName returns the name of the collation object.
+func (c *CollationObj) SpecName() string {
+	return c.T
+}
+
+// SpecType returns the HCL block type for a range object.
+func (r *RangeObj) SpecType() string {
+	return "range"
+}
+
+// SpecName returns the name of the range object.
+func (r *RangeObj) SpecName() string {
+	return r.T
 }
 
 // Underlying returns the underlying type of the array.
