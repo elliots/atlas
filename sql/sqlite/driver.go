@@ -127,17 +127,52 @@ func (d *Driver) Snapshot(ctx context.Context) (migrate.RestoreFunc, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !(r == nil || (len(r.Schemas) == 1 && r.Schemas[0].Name == mainFile && len(r.Schemas[0].Tables) == 0)) {
-		return nil, &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found table %q", r.Schemas[0].Tables[0].Name)}
+	if r != nil && len(r.Schemas) == 1 {
+		s := r.Schemas[0]
+		if len(s.Tables) > 0 {
+			return nil, &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found table %q", s.Tables[0].Name)}
+		}
+		if len(s.Views) > 0 {
+			return nil, &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found view %q", s.Views[0].Name)}
+		}
 	}
 	return func(ctx context.Context) error {
-		for _, stmt := range []string{
-			"PRAGMA writable_schema = 1;",
-			"DELETE FROM sqlite_master WHERE type IN ('table', 'view', 'index', 'trigger');",
-			"PRAGMA writable_schema = 0;",
-			"VACUUM;",
-		} {
-			if _, err := d.ExecContext(ctx, stmt); err != nil {
+		r, err := d.InspectRealm(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, s := range r.Schemas {
+			// Drop triggers first (owned by tables/views).
+			for _, t := range s.Tables {
+				for _, tr := range t.Triggers {
+					if _, err := d.ExecContext(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %q", tr.Name)); err != nil {
+						return err
+					}
+				}
+			}
+			for _, v := range s.Views {
+				for _, tr := range v.Triggers {
+					if _, err := d.ExecContext(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %q", tr.Name)); err != nil {
+						return err
+					}
+				}
+			}
+			// Drop views.
+			for _, v := range s.Views {
+				if _, err := d.ExecContext(ctx, fmt.Sprintf("DROP VIEW IF EXISTS %q", v.Name)); err != nil {
+					return err
+				}
+			}
+			// Drop tables (disable FK checks to avoid dependency order issues).
+			if _, err := d.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+				return err
+			}
+			for _, t := range s.Tables {
+				if _, err := d.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %q", t.Name)); err != nil {
+					return err
+				}
+			}
+			if _, err := d.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
 				return err
 			}
 		}
