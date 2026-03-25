@@ -287,6 +287,7 @@ CREATE TABLE users(
 			drv, err := Open(db)
 			require.NoError(t, err)
 			tt.before(mk)
+			mk.noTriggers()
 			s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
 				Tables: []string{"users"},
 				Mode:   ^schema.InspectViews,
@@ -477,6 +478,7 @@ func TestRegex_Checks(t *testing.T) {
 		mk.noColumns(name)
 		mk.noIndexes(name)
 		mk.noFKs(name)
+		mk.noTriggers()
 		drv, err := Open(db)
 		require.NoError(t, err)
 		s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
@@ -542,6 +544,7 @@ func TestRegex_GeneratedExpr(t *testing.T) {
 `, tt.column.Name)))
 		mk.noIndexes(name)
 		mk.noFKs(name)
+		mk.noTriggers()
 		drv, err := Open(db)
 		require.NoError(t, err)
 		s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
@@ -587,4 +590,9 @@ func (m mock) noIndexes(table string) {
 func (m mock) noFKs(table string) {
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(fksQuery, table))).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "from", "to", "table", "on_update", "on_delete"}))
+}
+
+func (m mock) noTriggers() {
+	m.ExpectQuery(sqltest.Escape("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name")).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tbl_name", "sql"}))
 }
