@@ -2502,3 +2502,155 @@ schema "public" {
 	require.Equal(t, &IndexInclude{Columns: []*schema.Column{s.Tables[0].Columns[1]}}, u3.Attrs[0])
 	require.Equal(t, UniqueConstraint("u3"), u3.Attrs[1].(*Constraint))
 }
+
+func TestMarshalSpec_Policy(t *testing.T) {
+	tbl := schema.NewTable("users").AddColumns(schema.NewIntColumn("id", "int"))
+	s := schema.New("public").AddTables(tbl)
+	s.AddObjects(
+		&Policy{
+			Name:  "allow_select",
+			Table: tbl,
+			As:    "permissive",
+			For:   "select",
+			To:    []string{"authenticated"},
+			Using: "user_id = current_user_id()",
+		},
+		&Policy{
+			Name:  "restrict_insert",
+			Table: tbl,
+			As:    "restrictive",
+			For:   "insert",
+			Check: "tenant_id = current_tenant()",
+		},
+	)
+	buf, err := MarshalHCL(s)
+	require.NoError(t, err)
+	require.Equal(t, `table "users" {
+  schema = schema.public
+  column "id" {
+    null = false
+    type = int
+  }
+}
+policy "allow_select" {
+  on    = table.users
+  as    = "permissive"
+  for   = "select"
+  to    = ["authenticated"]
+  using = "user_id = current_user_id()"
+}
+policy "restrict_insert" {
+  on         = table.users
+  as         = "restrictive"
+  for        = "insert"
+  with_check = "tenant_id = current_tenant()"
+}
+schema "public" {
+}
+`, string(buf))
+}
+
+func TestUnmarshalSpec_Policy(t *testing.T) {
+	var r schema.Realm
+	require.NoError(t, EvalHCLBytes([]byte(`
+table "users" {
+  schema = schema.public
+  column "id" {
+    null = false
+    type = int
+  }
+}
+policy "allow_select" {
+  on    = table.users
+  for   = "select"
+  to    = ["public"]
+  using = "true"
+}
+schema "public" {
+}
+`), &r, nil))
+	require.Len(t, r.Schemas, 1)
+	s := r.Schemas[0]
+	var policies []*Policy
+	for _, o := range s.Objects {
+		if p, ok := o.(*Policy); ok {
+			policies = append(policies, p)
+		}
+	}
+	require.Len(t, policies, 1)
+	p := policies[0]
+	require.Equal(t, "allow_select", p.Name)
+	require.NotNil(t, p.Table)
+	require.Equal(t, "users", p.Table.Name)
+	require.Equal(t, "select", p.For)
+	require.Equal(t, []string{"public"}, p.To)
+	require.Equal(t, "true", p.Using)
+}
+
+func TestMarshalSpec_EventTrigger(t *testing.T) {
+	r := schema.NewRealm(schema.New("public"))
+	r.Objects = append(r.Objects,
+		&EventTrigger{
+			Name:    "abort_ddl",
+			Event:   "ddl_command_start",
+			Tags:    []string{"DROP TABLE", "DROP INDEX"},
+			FuncRef: "abort_any_command",
+		},
+		&EventTrigger{
+			Name:    "log_ddl",
+			Event:   "ddl_command_end",
+			FuncRef: "log_ddl_command",
+		},
+	)
+	got, err := MarshalHCL.MarshalSpec(r)
+	require.NoError(t, err)
+	require.Equal(t, `event_trigger "abort_ddl" {
+  on   = "ddl_command_start"
+  tags = ["DROP TABLE", "DROP INDEX"]
+  execute {
+    function = function.abort_any_command
+  }
+}
+event_trigger "log_ddl" {
+  on = "ddl_command_end"
+  execute {
+    function = function.log_ddl_command
+  }
+}
+schema "public" {
+}
+`, string(got))
+}
+
+func TestUnmarshalSpec_EventTrigger(t *testing.T) {
+	var r schema.Realm
+	// The function block must be declared so that "function.abort_any_command" is in scope.
+	require.NoError(t, EvalHCLBytes([]byte(`
+function "abort_any_command" {
+  schema = schema.public
+  lang   = "plpgsql"
+  as     = "BEGIN RETURN; END;"
+}
+event_trigger "abort_ddl" {
+  on   = "ddl_command_start"
+  tags = ["DROP TABLE", "DROP INDEX"]
+  execute {
+    function = function.abort_any_command
+  }
+}
+schema "public" {
+}
+`), &r, nil))
+	var triggers []*EventTrigger
+	for _, o := range r.Objects {
+		if et, ok := o.(*EventTrigger); ok {
+			triggers = append(triggers, et)
+		}
+	}
+	require.Len(t, triggers, 1)
+	et := triggers[0]
+	require.Equal(t, "abort_ddl", et.Name)
+	require.Equal(t, "ddl_command_start", et.Event)
+	require.Equal(t, []string{"DROP TABLE", "DROP INDEX"}, et.Tags)
+	require.Equal(t, "abort_any_command", et.FuncRef)
+}

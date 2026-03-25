@@ -8,6 +8,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"ariga.io/atlas/schemahcl"
@@ -505,6 +506,105 @@ func TestDiff_RealmDiff(t *testing.T) {
 		&schema.AddObject{O: to.Objects[0]},
 		&schema.AddTable{T: to.Tables[0]},
 	}, changes)
+}
+
+func TestDiff_RealmDiff_EventTrigger(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mock{m}.version("130000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+
+	et := &EventTrigger{
+		Name:    "abort_ddl",
+		Event:   "ddl_command_start",
+		FuncRef: "abort_any_command",
+	}
+	to := schema.NewRealm()
+	to.Objects = append(to.Objects, et)
+
+	changes, err := drv.RealmDiff(schema.NewRealm(), to)
+	require.NoError(t, err)
+	require.EqualValues(t, []schema.Change{
+		&schema.AddObject{O: et},
+	}, changes)
+
+	// Chain into PlanChanges to verify SQL output.
+	plan, err := drv.PlanChanges(context.Background(), "plan", changes)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Contains(t, plan.Changes[0].Cmd, "CREATE EVENT TRIGGER")
+	require.Contains(t, plan.Changes[0].Cmd, "abort_ddl")
+}
+
+func TestDiff_RealmDiff_EventTrigger_E2E(t *testing.T) {
+	// Full pipeline: HCL → EvalHCLBytes → RealmDiff → PlanChanges → SQL
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mock{m}.version("130000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+
+	var to schema.Realm
+	err = EvalHCLBytes([]byte(`
+function "abort_any_command" {
+  schema = schema.public
+  lang   = "plpgsql"
+  as     = "BEGIN RETURN; END;"
+}
+event_trigger "abort_ddl" {
+  on   = "ddl_command_start"
+  tags = ["DROP TABLE", "DROP INDEX"]
+  execute {
+    function = function.abort_any_command
+  }
+}
+schema "public" {
+}
+`), &to, nil)
+	require.NoError(t, err)
+
+	// Verify event trigger was parsed into realm objects.
+	var etCount int
+	for _, o := range to.Objects {
+		if _, ok := o.(*EventTrigger); ok {
+			etCount++
+		}
+	}
+	require.Equal(t, 1, etCount, "expected 1 EventTrigger in realm.Objects")
+
+	changes, err := drv.RealmDiff(schema.NewRealm(), &to)
+	require.NoError(t, err)
+
+	// Check that an AddObject for EventTrigger is in the changes.
+	var hasET bool
+	for _, c := range changes {
+		if ao, ok := c.(*schema.AddObject); ok {
+			if _, ok := ao.O.(*EventTrigger); ok {
+				hasET = true
+			}
+		}
+	}
+	require.True(t, hasET, "expected AddObject{EventTrigger} in changes, got: %v", changes)
+
+	plan, err := drv.PlanChanges(context.Background(), "plan", changes)
+	require.NoError(t, err)
+
+	// Find the CREATE EVENT TRIGGER statement.
+	var foundSQL string
+	for _, c := range plan.Changes {
+		if strings.Contains(c.Cmd, "EVENT TRIGGER") {
+			foundSQL = c.Cmd
+		}
+	}
+	var cmds []string
+	for _, c := range plan.Changes {
+		cmds = append(cmds, c.Cmd)
+	}
+	require.NotEmpty(t, foundSQL, "expected CREATE EVENT TRIGGER in plan, got: %v", cmds)
+	require.Contains(t, foundSQL, "abort_ddl")
+	require.Contains(t, foundSQL, "ddl_command_start")
+	require.Contains(t, foundSQL, "abort_any_command")
 }
 
 func TestDiff_SchemaDiff(t *testing.T) {

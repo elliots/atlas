@@ -87,6 +87,9 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 			if err := i.inspectTriggers(ctx, r, nil); err != nil {
 				return nil, err
 			}
+			if err := i.inspectPolicies(ctx, r, nil); err != nil {
+				return nil, err
+			}
 		}
 		if err := i.inspectDeps(ctx, r, nil); err != nil {
 			return nil, err
@@ -183,6 +186,9 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 		if err := i.inspectTriggers(ctx, r, nil); err != nil {
 			return nil, err
 		}
+		if err := i.inspectPolicies(ctx, r, nil); err != nil {
+			return nil, err
+		}
 	}
 	if err := i.inspectDeps(ctx, r, opts); err != nil {
 		return nil, err
@@ -241,8 +247,9 @@ func (i *inspect) tables(ctx context.Context, realm *schema.Realm, opts *schema.
 		var (
 			oid                                                            sql.NullInt64
 			tSchema, name, comment, partattrs, partstart, partexprs, extra sql.NullString
+			rlsEnabled, rlsForced                                          sql.NullBool
 		)
-		if err := rows.Scan(&oid, &tSchema, &name, &comment, &partattrs, &partstart, &partexprs, &extra); err != nil {
+		if err := rows.Scan(&oid, &tSchema, &name, &comment, &partattrs, &partstart, &partexprs, &extra, &rlsEnabled, &rlsForced); err != nil {
 			return fmt.Errorf("scan table information: %w", err)
 		}
 		if !sqlx.ValidString(tSchema) || !sqlx.ValidString(name) {
@@ -265,6 +272,12 @@ func (i *inspect) tables(ctx context.Context, realm *schema.Realm, opts *schema.
 				start: partstart.String,
 				attrs: partattrs.String,
 				exprs: partexprs.String,
+			})
+		}
+		if (rlsEnabled.Valid && rlsEnabled.Bool) || (rlsForced.Valid && rlsForced.Bool) {
+			t.AddAttrs(&RowLevelSecurity{
+				Enabled: rlsEnabled.Valid && rlsEnabled.Bool,
+				Forced:  rlsForced.Valid && rlsForced.Bool,
 			})
 		}
 	}
@@ -934,6 +947,13 @@ type (
 		V int64
 	}
 
+	// RowLevelSecurity indicates whether row-level security is enabled on a table.
+	RowLevelSecurity struct {
+		schema.Attr
+		Enabled bool
+		Forced  bool // FORCE ROW LEVEL SECURITY (applies to table owner too).
+	}
+
 	// ArrayType defines an array type.
 	// https://postgresql.org/docs/current/arrays.html
 	ArrayType struct {
@@ -1102,6 +1122,33 @@ type (
 		T       string // Extension name.
 		Schema  string // Schema the extension is installed in.
 		Version string // Extension version.
+	}
+
+	// Policy defines a row-level security policy.
+	// https://www.postgresql.org/docs/current/sql-createpolicy.html
+	Policy struct {
+		schema.Object
+		Name  string         // Policy name.
+		Table *schema.Table  // Table the policy applies to.
+		As    string         // PERMISSIVE or RESTRICTIVE.
+		For   string         // ALL, SELECT, INSERT, UPDATE, DELETE.
+		To    []string       // Target roles.
+		Using string         // USING expression (qual).
+		Check string         // WITH CHECK expression.
+		Attrs []schema.Attr
+		Deps  []schema.Object
+	}
+
+	// EventTrigger defines a database-level event trigger.
+	// https://www.postgresql.org/docs/current/sql-createeventtrigger.html
+	EventTrigger struct {
+		schema.Object
+		Name    string    // Trigger name.
+		Event   string    // Event type: ddl_command_start, ddl_command_end, table_rewrite, sql_drop.
+		Tags    []string  // Command tag filters (WHEN TAG IN ...).
+		FuncRef string    // Function to execute.
+		Attrs   []schema.Attr
+		Deps    []schema.Object
 	}
 
 	// Identity defines an identity column.

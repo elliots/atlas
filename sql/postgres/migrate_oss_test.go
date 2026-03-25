@@ -2149,6 +2149,240 @@ func TestPlanChanges(t *testing.T) {
 				},
 			},
 		},
+		// Policy: add (permissive SELECT policy with USING clause).
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Policy{
+					Name:  "allow_select",
+					Table: &schema.Table{Name: "users", Schema: &schema.Schema{Name: "public"}},
+					As:    "permissive",
+					For:   "select",
+					To:    []string{"authenticated"},
+					Using: "user_id = current_user_id()",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE POLICY "allow_select" ON "public"."users" AS PERMISSIVE FOR SELECT TO authenticated USING (user_id = current_user_id())`,
+						Reverse: `DROP POLICY IF EXISTS "allow_select" ON "public"."users"`,
+					},
+				},
+			},
+		},
+		// Policy: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropObject{O: &Policy{
+					Name:  "allow_select",
+					Table: &schema.Table{Name: "users", Schema: &schema.Schema{Name: "public"}},
+					For:   "select",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `DROP POLICY IF EXISTS "allow_select" ON "public"."users"`,
+						Reverse: `CREATE POLICY "allow_select" ON "public"."users" FOR SELECT`,
+					},
+				},
+			},
+		},
+		// Policy: modify (drop + recreate).
+		{
+			changes: []schema.Change{
+				&schema.ModifyObject{
+					From: &Policy{
+						Name:  "allow_select",
+						Table: &schema.Table{Name: "users", Schema: &schema.Schema{Name: "public"}},
+						For:   "select",
+						Using: "old_expr()",
+					},
+					To: &Policy{
+						Name:  "allow_select",
+						Table: &schema.Table{Name: "users", Schema: &schema.Schema{Name: "public"}},
+						For:   "select",
+						Using: "new_expr()",
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP POLICY IF EXISTS "allow_select" ON "public"."users"`,
+					},
+					{
+						Cmd: `CREATE POLICY "allow_select" ON "public"."users" FOR SELECT USING (new_expr())`,
+					},
+				},
+			},
+		},
+		// Policy: add with WITH CHECK clause.
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &Policy{
+					Name:  "rls_insert",
+					Table: &schema.Table{Name: "documents", Schema: &schema.Schema{Name: "public"}},
+					For:   "insert",
+					To:    []string{"public"},
+					Check: "author_id = current_user_id()",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE POLICY "rls_insert" ON "public"."documents" FOR INSERT TO public WITH CHECK (author_id = current_user_id())`,
+						Reverse: `DROP POLICY IF EXISTS "rls_insert" ON "public"."documents"`,
+					},
+				},
+			},
+		},
+		// Event trigger: add (with tag filter).
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &EventTrigger{
+					Name:    "abort_ddl",
+					Event:   "ddl_command_start",
+					Tags:    []string{"DROP TABLE", "DROP INDEX"},
+					FuncRef: "abort_any_command",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE EVENT TRIGGER "abort_ddl" ON ddl_command_start WHEN TAG IN ('DROP TABLE', 'DROP INDEX') EXECUTE FUNCTION "abort_any_command" ()`,
+						Reverse: `DROP EVENT TRIGGER IF EXISTS "abort_ddl"`,
+					},
+				},
+			},
+		},
+		// Event trigger: add (no tag filter).
+		{
+			changes: []schema.Change{
+				&schema.AddObject{O: &EventTrigger{
+					Name:    "log_ddl",
+					Event:   "ddl_command_end",
+					FuncRef: "log_ddl_command",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `CREATE EVENT TRIGGER "log_ddl" ON ddl_command_end EXECUTE FUNCTION "log_ddl_command" ()`,
+						Reverse: `DROP EVENT TRIGGER IF EXISTS "log_ddl"`,
+					},
+				},
+			},
+		},
+		// Event trigger: drop.
+		{
+			changes: []schema.Change{
+				&schema.DropObject{O: &EventTrigger{
+					Name:    "abort_ddl",
+					Event:   "ddl_command_start",
+					FuncRef: "abort_any_command",
+				}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `DROP EVENT TRIGGER IF EXISTS "abort_ddl"`,
+						Reverse: `CREATE EVENT TRIGGER "abort_ddl" ON ddl_command_start EXECUTE FUNCTION "abort_any_command" ()`,
+					},
+				},
+			},
+		},
+		// ModifyTable: enable RLS on an existing table.
+		{
+			changes: func() []schema.Change {
+				to := schema.NewTable("users").SetSchema(schema.New("public")).AddColumns(schema.NewIntColumn("id", "bigint")).AddAttrs(&RowLevelSecurity{Enabled: true})
+				return []schema.Change{
+					&schema.ModifyTable{
+						T: to,
+						Changes: []schema.Change{
+							&schema.ModifyAttr{
+								From: &RowLevelSecurity{},
+								To:   &RowLevelSecurity{Enabled: true},
+							},
+						},
+					},
+				}
+			}(),
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     `ALTER TABLE "public"."users" ENABLE ROW LEVEL SECURITY`,
+						Reverse: `ALTER TABLE "public"."users" DISABLE ROW LEVEL SECURITY`,
+					},
+				},
+			},
+		},
+		// AddTable with RLS enabled emits ALTER TABLE ENABLE ROW LEVEL SECURITY.
+		{
+			changes: []schema.Change{
+				&schema.AddTable{
+					T: schema.NewTable("users").
+						SetSchema(schema.New("public")).
+						AddColumns(schema.NewIntColumn("id", "bigint")).
+						AddAttrs(&RowLevelSecurity{Enabled: true}),
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{Cmd: `CREATE TABLE "public"."users" ("id" bigint NOT NULL)`, Reverse: `DROP TABLE "public"."users"`},
+					{Cmd: `ALTER TABLE "public"."users" ENABLE ROW LEVEL SECURITY`, Reverse: `ALTER TABLE "public"."users" DISABLE ROW LEVEL SECURITY`},
+				},
+			},
+		},
+		// Event trigger: modify (drop + recreate).
+		{
+			changes: []schema.Change{
+				&schema.ModifyObject{
+					From: &EventTrigger{
+						Name:    "abort_ddl",
+						Event:   "ddl_command_start",
+						Tags:    []string{"DROP TABLE"},
+						FuncRef: "abort_any_command",
+					},
+					To: &EventTrigger{
+						Name:    "abort_ddl",
+						Event:   "ddl_command_start",
+						Tags:    []string{"DROP TABLE", "TRUNCATE"},
+						FuncRef: "abort_any_command",
+					},
+				},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{
+						Cmd: `DROP EVENT TRIGGER IF EXISTS "abort_ddl"`,
+					},
+					{
+						Cmd: `CREATE EVENT TRIGGER "abort_ddl" ON ddl_command_start WHEN TAG IN ('DROP TABLE', 'TRUNCATE') EXECUTE FUNCTION "abort_any_command" ()`,
+					},
+				},
+			},
+		},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {

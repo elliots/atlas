@@ -380,11 +380,11 @@ func TestDriver_InspectPartitionedTable(t *testing.T) {
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "$1"))).
 		WithArgs("public").
 		WillReturnRows(sqltest.Rows(`
- oid   | table_schema | table_name  | comment | partition_attrs | partition_strategy |                  partition_exprs                   |                  extra                   
--------+--------------+-------------+---------+-----------------+--------------------+----------------------------------------------------+----------------------------------------------------
- 112  | public       | logs1       |         |                 |                     |                                                    |                                                    
- 113  | public       | logs2       |         | 1               | r                   |                                                    |                                                    
- 114  | public       | logs3       |         | 2 0 0           | l                   | (a + b), (a + (b * 2))                             |                              
+ oid   | table_schema | table_name  | comment | partition_attrs | partition_strategy |                  partition_exprs                   |                  extra                   | relrowsecurity | relforcerowsecurity
+-------+--------------+-------------+---------+-----------------+--------------------+----------------------------------------------------+----------------------------------------------------+----------------+--------------------
+ 112  | public       | logs1       |         |                 |                     |                                                    |                                                    | false          | false
+ 113  | public       | logs2       |         | 1               | r                   |                                                    |                                                    | false          | false
+ 114  | public       | logs3       |         | 2 0 0           | l                   | (a + b), (a + (b * 2))                             |                              | false          | false
 
 `))
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(columnsQuery, "$2, $3, $4"))).
@@ -521,7 +521,7 @@ func TestDriver_InspectSchema(t *testing.T) {
 `))
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "$1"))).
 		WithArgs("test").
-		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs"}))
+		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs", "relrowsecurity", "relforcerowsecurity"}))
 	s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
 		Mode: schema.InspectSchemas | schema.InspectTables,
 	})
@@ -560,7 +560,7 @@ func TestDriver_Realm(t *testing.T) {
 `))
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "$1, $2"))).
 		WithArgs("test", "public").
-		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs"}))
+		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs", "relrowsecurity", "relforcerowsecurity"}))
 	// Reset search_path to 'public'.
 	mk.ExpectQuery(sqltest.Escape("SELECT set_config('search_path', $1, false)")).
 		WithArgs("public").
@@ -602,7 +602,7 @@ func TestDriver_Realm(t *testing.T) {
 `))
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "$1, $2"))).
 		WithArgs("test", "public").
-		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs"}))
+		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs", "relrowsecurity", "relforcerowsecurity"}))
 	realm, err = drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Schemas: []string{"test", "public"},
 		Mode:    schema.InspectSchemas | schema.InspectTables,
@@ -640,7 +640,7 @@ func TestDriver_Realm(t *testing.T) {
 `))
 	m.ExpectQuery(sqltest.Escape(fmt.Sprintf(tablesQuery, "$1"))).
 		WithArgs("test").
-		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs"}))
+		WillReturnRows(sqlmock.NewRows([]string{"table_schema", "table_name", "comment", "partition_attrs", "partition_strategy", "partition_exprs", "relrowsecurity", "relforcerowsecurity"}))
 	realm, err = drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Schemas: []string{"test"},
 		Mode:    schema.InspectSchemas | schema.InspectTables,
@@ -726,9 +726,9 @@ func (m mock) version(version string) {
 }
 
 func (m mock) tableExists(schema, table string, exists bool) {
-	rows := sqlmock.NewRows([]string{"oid", "table_schema", "table_name", "table_comment", "partition_attrs", "partition_strategy", "partition_exprs", "row_security"})
+	rows := sqlmock.NewRows([]string{"oid", "table_schema", "table_name", "table_comment", "partition_attrs", "partition_strategy", "partition_exprs", "extra", "relrowsecurity", "relforcerowsecurity"})
 	if exists {
-		rows.AddRow(nil, schema, table, nil, nil, nil, nil, nil)
+		rows.AddRow(nil, schema, table, nil, nil, nil, nil, nil, false, false)
 	}
 	m.ExpectQuery(queryTables).
 		WithArgs(schema).
