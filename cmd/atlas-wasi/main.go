@@ -339,7 +339,19 @@ func extractChanges(changes []schema.Change) []Change {
 	for _, c := range changes {
 		switch v := c.(type) {
 		case *schema.AddTable:
-			result = append(result, Change{Type: "add_table", Table: v.T.Name})
+			// Include column names in detail
+			var cols []string
+			for _, c := range v.T.Columns {
+				cols = append(cols, c.Name)
+			}
+			detail := ""
+			if len(cols) > 0 {
+				detail = strings.Join(cols, ", ")
+			}
+			result = append(result, Change{Type: "add_table", Table: v.T.Name, Detail: detail})
+			for _, idx := range v.T.Indexes {
+				result = append(result, Change{Type: "add_index", Table: v.T.Name, Name: idx.Name})
+			}
 		case *schema.DropTable:
 			result = append(result, Change{Type: "drop_table", Table: v.T.Name})
 		case *schema.RenameTable:
@@ -350,10 +362,14 @@ func extractChanges(changes []schema.Change) []Change {
 			result = append(result, Change{Type: "add_view", Table: v.V.Name})
 		case *schema.DropView:
 			result = append(result, Change{Type: "drop_view", Table: v.V.Name})
+		case *schema.ModifyView:
+			result = append(result, Change{Type: "modify_view", Table: v.To.Name})
 		case *schema.AddFunc:
 			result = append(result, Change{Type: "add_function", Table: v.F.Name})
 		case *schema.DropFunc:
 			result = append(result, Change{Type: "drop_function", Table: v.F.Name})
+		case *schema.ModifyFunc:
+			result = append(result, Change{Type: "modify_function", Table: v.To.Name})
 		case *schema.ModifySchema:
 			// Schema-level changes may contain nested table/view/func changes
 			result = append(result, extractChanges(v.Changes)...)

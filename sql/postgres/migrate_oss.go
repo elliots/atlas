@@ -214,6 +214,16 @@ func (s *state) topLevel(changes []schema.Change) ([]schema.Change, error) {
 				Reverse: s.Build("ALTER TYPE").Ident(e2.T).P("RENAME TO").Ident(e1.T).String(),
 				Comment: fmt.Sprintf("rename an enum from %q to %q", e1.T, e2.T),
 			})
+		case *schema.AddObject:
+			// Extensions must be created before tables/types that use their types
+			// (e.g., hstore, postgis). Other AddObject types go to the sorted phase.
+			if _, ok := c.O.(*Extension); ok {
+				if err := s.addObject(c); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			planned = append(planned, c)
 		default:
 			planned = append(planned, c)
 		}

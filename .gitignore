@@ -1,2 +1,6 @@
 
 *.wasm
+
+cmd/atlas-wasi/atlas-wasi
+
+.claude/

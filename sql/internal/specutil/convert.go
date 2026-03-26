@@ -873,6 +873,10 @@ func dependsOn(realm *schema.Realm, objects []schema.Object) (*schemahcl.Attr, b
 			// If the object is a reference, add it to the depends_on list.
 			deps = append(deps, d.Ref())
 			continue
+		case SpecTypeNamer:
+			// Driver-specific objects (composites, domains, etc.) that implement
+			// SpecTypeNamer can produce their own name for the depends_on ref.
+			n = d.SpecName()
 		}
 		if len(n2s[name(o, n)]) > 1 {
 			path = append(path, s)

@@ -64,7 +64,6 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 				return nil, err
 			}
 			sqlx.LinkSchemaTables(schemas)
-			resolveColumnTypes(r)
 		}
 		if mode.Is(schema.InspectViews) {
 			if err := i.inspectViews(ctx, r, nil); err != nil {
@@ -95,6 +94,7 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 		if err := i.inspectDeps(ctx, r, nil); err != nil {
 			return nil, err
 		}
+		resolveColumnTypes(r)
 	}
 	return schema.ExcludeRealm(r, opts.Exclude)
 }
@@ -167,7 +167,6 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 			return nil, err
 		}
 		sqlx.LinkSchemaTables(schemas)
-		resolveColumnTypes(r)
 	}
 	if mode.Is(schema.InspectViews) {
 		if err := i.inspectViews(ctx, r, opts); err != nil {
@@ -195,6 +194,7 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 	if err := i.inspectDeps(ctx, r, opts); err != nil {
 		return nil, err
 	}
+	resolveColumnTypes(r)
 	return schema.ExcludeSchema(r.Schemas[0], opts.Exclude)
 }
 
@@ -451,10 +451,12 @@ func (i *inspect) underlyingType(s *schema.Schema, u *UserDefinedType) schema.Ty
 // (EnumType, DomainType) that were inspected separately. This enables the
 // dependency sorter to correctly order type creation before table creation.
 func resolveColumnTypes(r *schema.Realm) {
+	// Build realm-wide lookup of type names → objects.
+	// Keys include both unqualified ("color") and qualified ("b.color") forms.
+	enums := make(map[string]*schema.EnumType)
+	domains := make(map[string]*DomainType)
+	composites := make(map[string]*CompositeType)
 	for _, s := range r.Schemas {
-		// Build lookup of enum/domain names → objects.
-		enums := make(map[string]*schema.EnumType)
-		domains := make(map[string]*DomainType)
 		for _, o := range s.Objects {
 			switch v := o.(type) {
 			case *schema.EnumType:
@@ -467,26 +469,118 @@ func resolveColumnTypes(r *schema.Realm) {
 				if s.Name != "" {
 					domains[s.Name+"."+v.T] = v
 				}
+			case *CompositeType:
+				composites[v.T] = v
+				if s.Name != "" {
+					composites[s.Name+"."+v.T] = v
+				}
 			}
 		}
-		// Resolve column types.
+	}
+	// resolveType resolves a column type to its actual schema object.
+	// Handles both UserDefinedType (from table columns with typtype info)
+	// and UnsupportedType (from composite fields without typtype info).
+	resolveType := func(ct *schema.ColumnType) {
+		if ct == nil || ct.Type == nil {
+			return
+		}
+		switch t := ct.Type.(type) {
+		case *UserDefinedType:
+			switch t.C {
+			case "e":
+				if e, ok := enums[t.T]; ok {
+					ct.Type = e
+				}
+			case "d":
+				if d, ok := domains[t.T]; ok {
+					ct.Type = d
+				}
+			case "":
+				// Composite fields from ParseType have no typtype info.
+				// Try matching by name against known enums and domains.
+				if e, ok := enums[t.T]; ok {
+					ct.Type = e
+				} else if d, ok := domains[t.T]; ok {
+					ct.Type = d
+				}
+			}
+		case *schema.UnsupportedType:
+			// Composite type fields use UnsupportedType for cross-schema refs.
+			if e, ok := enums[t.T]; ok {
+				ct.Type = e
+			} else if d, ok := domains[t.T]; ok {
+				ct.Type = d
+			} else {
+				// Try stripping "public." prefix as a last resort.
+				name := t.T
+				if idx := strings.LastIndex(name, "."); idx >= 0 {
+					name = name[idx+1:]
+				}
+				if e, ok := enums[name]; ok {
+					ct.Type = e
+				} else if d, ok := domains[name]; ok {
+					ct.Type = d
+				}
+			}
+		}
+	}
+	// Also add DepsOf support for RangeObj.
+	// (RangeObj.Deps is populated below alongside composites.)
+
+	// Resolve column types across all schemas.
+	for _, s := range r.Schemas {
 		for _, t := range s.Tables {
 			for _, c := range t.Columns {
-				if c.Type == nil || c.Type.Type == nil {
-					continue
+				resolveType(c.Type)
+			}
+		}
+		// Resolve range type subtype dependencies.
+		for _, o := range s.Objects {
+			if ro, ok := o.(*RangeObj); ok {
+				var typeName string
+				switch t := ro.Subtype.(type) {
+				case *UserDefinedType:
+					typeName = t.T
+				case *schema.UnsupportedType:
+					typeName = t.T
 				}
-				u, ok := c.Type.Type.(*UserDefinedType)
-				if !ok {
-					continue
-				}
-				switch u.C {
-				case "e": // enum
-					if e, ok := enums[u.T]; ok {
-						c.Type.Type = e
+				if typeName != "" {
+					if e, ok := enums[typeName]; ok {
+						ro.Deps = append(ro.Deps, e)
+					} else if d, ok := domains[typeName]; ok {
+						ro.Deps = append(ro.Deps, d)
+					} else if c, ok := composites[typeName]; ok {
+						ro.Deps = append(ro.Deps, c)
 					}
-				case "d": // domain
-					if d, ok := domains[u.T]; ok {
-						c.Type.Type = d
+				}
+			}
+		}
+		// Resolve composite type field dependencies WITHOUT replacing the field type.
+		// We only add deps for sorting — the field type stays as-is (e.g., "b.color")
+		// so that FormatType produces the schema-qualified name correctly.
+		for _, o := range s.Objects {
+			if ct, ok := o.(*CompositeType); ok {
+				for _, f := range ct.Fields {
+					if f.Type == nil {
+						continue
+					}
+					// Check if the field type matches a known enum/domain by name.
+					var typeName string
+					switch t := f.Type.Type.(type) {
+					case *UserDefinedType:
+						typeName = t.T
+					case *schema.UnsupportedType:
+						typeName = t.T
+					}
+					if typeName == "" {
+						continue
+					}
+					if e, ok := enums[typeName]; ok {
+						ct.Deps = append(ct.Deps, e)
+					} else if d, ok := domains[typeName]; ok {
+						ct.Deps = append(ct.Deps, d)
+					} else if c2, ok := composites[typeName]; ok && c2 != ct {
+						ct.Deps = append(ct.Deps, c2)
 					}
 				}
 			}
@@ -1429,6 +1523,16 @@ func (c *CollationObj) SpecName() string {
 // used by the topological sort for AddObject ordering).
 func (a *Aggregate) DepsOf() []schema.Object {
 	return a.Deps
+}
+
+// DepsOf returns the dependencies of this composite type.
+func (c *CompositeType) DepsOf() []schema.Object {
+	return c.Deps
+}
+
+// DepsOf returns the dependencies of this range type.
+func (r *RangeObj) DepsOf() []schema.Object {
+	return r.Deps
 }
 
 // SpecType returns the HCL block type for a range object.
