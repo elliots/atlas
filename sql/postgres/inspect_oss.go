@@ -1535,6 +1535,36 @@ func (r *RangeObj) DepsOf() []schema.Object {
 	return r.Deps
 }
 
+// DepsOf returns the dependencies of this policy.
+func (p *Policy) DepsOf() []schema.Object {
+	return p.Deps
+}
+
+// DepsOf returns the dependencies of this event trigger.
+func (e *EventTrigger) DepsOf() []schema.Object {
+	return e.Deps
+}
+
+// DepsOf returns the dependencies of this domain type.
+func (d *DomainType) DepsOf() []schema.Object {
+	return d.Deps
+}
+
+// DepsOf returns the dependencies of this collation.
+func (c *CollationObj) DepsOf() []schema.Object {
+	return c.Deps
+}
+
+// DepsOf returns the dependencies of this cast.
+func (c *Cast) DepsOf() []schema.Object {
+	return c.Deps
+}
+
+// DepsOf returns the dependencies of this role.
+func (r *Role) DepsOf() []schema.Object {
+	return r.Deps
+}
+
 // SpecType returns the HCL block type for a range object.
 func (r *RangeObj) SpecType() string {
 	return "range"
