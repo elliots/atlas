@@ -117,6 +117,11 @@ type (
 		// PlanWithSchemaQualifier allows setting a custom schema to prefix
 		// tables and other resources. An empty string indicates no qualifier.
 		SchemaQualifier *string
+		// StripDefaultSchema controls output formatting only: objects in this schema
+		// are emitted without a schema prefix, while objects in other schemas keep
+		// their qualifier. Unlike SchemaQualifier, this does not restrict the plan
+		// to a single schema — AddSchema/DropSchema are still allowed.
+		StripDefaultSchema *string
 		// Indent is the string to use for indentation.
 		// If empty, no indentation is used.
 		Indent string

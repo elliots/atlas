@@ -361,7 +361,7 @@ func (*Driver) StmtBuilder(opts migrate.PlanOptions) *sqlx.Builder {
 	return &sqlx.Builder{
 		QuoteOpening: '"',
 		QuoteClosing: '"',
-		Schema:       opts.SchemaQualifier,
+		Schema:       opts.StripDefaultSchema,
 		Indent:       opts.Indent,
 	}
 }

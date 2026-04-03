@@ -71,6 +71,11 @@ type Cmd struct {
 
 	// For "diff": known renames from @docs.previously tags.
 	Renames []Rename `json:"renames,omitempty"`
+
+	// For "diff": strip this schema name from output identifiers.
+	// Objects in this schema are unqualified; objects in other schemas keep their qualifier.
+	// Independent of Schema (which controls inspection scope).
+	DefaultSchema string `json:"defaultSchema,omitempty"`
 }
 
 // Change describes a single structured schema change for CLI rendering.
@@ -185,20 +190,23 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 	}
 
 	// Inspect the resulting schema.
-	var realm *schema.Realm
-	if schemaName != "" {
-		s, err := drv.InspectSchema(ctx, schemaName, nil)
-		if err != nil {
-			return nil, err
-		}
-		realm = schema.NewRealm(s)
-	} else {
-		var err error
-		realm, err = drv.InspectRealm(ctx, nil)
-		if err != nil {
-			return nil, err
+	// Always inspect all schemas so multi-schema setups (e.g. public + auth) are captured.
+	// Filter out Postgres system schemas that aren't user-created.
+	realm, err := drv.InspectRealm(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	var filtered []*schema.Schema
+	for _, s := range realm.Schemas {
+		switch s.Name {
+		case "information_schema", "pg_catalog", "pg_toast":
+			continue
+		default:
+			// Keep "public" and any user-created schemas (auth, etc.)
+			filtered = append(filtered, s)
 		}
 	}
+	realm.Schemas = filtered
 
 	// Attach tags to schema objects.
 	tagIdx.ApplyTags(realm)
@@ -319,7 +327,14 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 
 	var diffStmts []string
 	if len(changes) > 0 {
-		plan, err := drv.PlanChanges(ctx, "migration", changes)
+		var planOpts []migrate.PlanOption
+		if cmd.DefaultSchema != "" {
+			q := cmd.DefaultSchema
+			planOpts = append(planOpts, func(o *migrate.PlanOptions) {
+				o.StripDefaultSchema = &q
+			})
+		}
+		plan, err := drv.PlanChanges(ctx, "migration", changes, planOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("plan: %w", err)
 		}

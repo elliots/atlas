@@ -409,14 +409,17 @@ func (b *Builder) SchemaResource(s *schema.Schema, name string) *Builder {
 
 func (b *Builder) mayQualify(s *schema.Schema, top string, children ...string) *Builder {
 	switch {
-	// Custom qualifier.
+	// Custom qualifier: strip objects in this schema, qualify all others.
 	case b.Schema != nil:
-		// Empty means skip prefix.
-		if *b.Schema != "" {
-			b.Ident(*b.Schema)
+		if *b.Schema == "" {
+			// Empty qualifier: strip all schema prefixes.
+		} else if s != nil && s.Name != "" && s.Name != *b.Schema {
+			// Object is in a different schema — qualify with its actual schema.
+			b.Ident(s.Name)
 			b.rewriteLastByte('.')
 		}
-	// Default schema qualifier.
+		// Object is in the default schema — no prefix.
+	// No custom qualifier — use the schema name as-is.
 	case s != nil && s.Name != "":
 		b.Ident(s.Name)
 		b.rewriteLastByte('.')
