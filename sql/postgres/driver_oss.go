@@ -860,6 +860,10 @@ func parseFuncArgs(argsStr string) []*schema.FuncArg {
 			arg.Mode = schema.FuncArgModeVariadic
 			part = strings.TrimSpace(part[9:])
 		}
+		// Strip DEFAULT clauses — pg_get_function_arguments includes them but they're not part of the type.
+		if idx := strings.Index(strings.ToUpper(part), " DEFAULT "); idx != -1 {
+			part = strings.TrimSpace(part[:idx])
+		}
 		// Split into name and type. The last word(s) are the type.
 		// But arg might be unnamed: just "integer".
 		// If there are 2+ tokens and the first is not a known type, treat it as name.
@@ -873,7 +877,7 @@ func parseFuncArgs(argsStr string) []*schema.FuncArg {
 			// Try to parse everything after the first token as a type.
 			typStr := strings.Join(tokens[1:], " ")
 			if t, err := ParseType(typStr); err == nil {
-				arg.Name = tokens[0]
+				arg.Name = strings.Trim(tokens[0], `"`)
 				arg.Type = t
 			} else if t, err := ParseType(part); err == nil {
 				// Entire string is a type (e.g., "double precision").
@@ -885,6 +889,26 @@ func parseFuncArgs(argsStr string) []*schema.FuncArg {
 		}
 	}
 	return args
+}
+
+// stripOwnSchemaFromType removes the function's own schema prefix from type strings.
+// e.g. "SETOF public.posts" -> "SETOF posts" when ownSchema is "public".
+// Cross-schema references (e.g. "SETOF auth.users" when ownSchema is "public") are preserved.
+func stripOwnSchemaFromType(t string, ownSchema string) string {
+	prefix := ownSchema + "."
+	lower := strings.ToLower(t)
+	lowerPrefix := strings.ToLower(prefix)
+	if strings.HasPrefix(lower, "setof ") {
+		rest := t[6:]
+		if strings.HasPrefix(strings.ToLower(rest), lowerPrefix) {
+			return t[:6] + rest[len(prefix):]
+		}
+		return t
+	}
+	if strings.HasPrefix(lower, lowerPrefix) {
+		return t[len(prefix):]
+	}
+	return t
 }
 
 // extractFuncBody extracts just the function body from a pg_get_functiondef DDL string.
@@ -1413,6 +1437,66 @@ func (i *inspect) inspectViews(ctx context.Context, r *schema.Realm, opts *schem
 		}
 		s.Views = append(s.Views, v)
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Populate view columns from pg_attribute.
+	return i.inspectViewColumns(ctx, r)
+}
+
+func (i *inspect) inspectViewColumns(ctx context.Context, r *schema.Realm) error {
+	schemas := make(map[string]*schema.Schema)
+	for _, s := range r.Schemas {
+		schemas[s.Name] = s
+	}
+	placeholders := make([]string, 0, len(schemas))
+	args := make([]any, 0, len(schemas))
+	idx := 0
+	for name := range schemas {
+		idx++
+		placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
+		args = append(args, name)
+	}
+	query := fmt.Sprintf(viewColumnsQuery, strings.Join(placeholders, ", "))
+	rows, err := i.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("postgres: inspecting view columns: %w", err)
+	}
+	defer rows.Close()
+	// Build view lookup.
+	viewMap := make(map[string]*schema.View)
+	for _, s := range r.Schemas {
+		for _, v := range s.Views {
+			viewMap[s.Name+"."+v.Name] = v
+		}
+	}
+	for rows.Next() {
+		var (
+			schemaName, viewName, colName, colType string
+			isNullable                             bool
+		)
+		if err := rows.Scan(&schemaName, &viewName, &colName, &colType, &isNullable); err != nil {
+			return fmt.Errorf("postgres: scanning view column: %w", err)
+		}
+		v, ok := viewMap[schemaName+"."+viewName]
+		if !ok {
+			continue
+		}
+		t, err := ParseType(colType)
+		if err != nil {
+			t = &schema.UnsupportedType{T: colType}
+		}
+		// "?column?" is Postgres's default for unnamed expressions (e.g. SELECT 1).
+		// Treat as unnamed so downstream consumers can handle it appropriately.
+		if colName == "?column?" {
+			colName = ""
+		}
+		col := schema.NewColumn(colName).SetType(t)
+		if isNullable {
+			col.Type.Null = true
+		}
+		v.Columns = append(v.Columns, col)
+	}
 	return rows.Err()
 }
 
@@ -1457,11 +1541,14 @@ func (i *inspect) inspectFuncs(ctx context.Context, r *schema.Realm, opts *schem
 		case "f": // normal function
 			f := &schema.Func{Name: funcName, Schema: s, Body: def, Lang: lang, Args: args}
 			if retType != "" {
-				if t, err := ParseType(retType); err == nil {
+				// Strip own-schema qualification from return types (e.g. "SETOF public.posts" -> "SETOF posts"
+				// when the function is in "public" schema). Cross-schema refs are preserved.
+				cleanRet := stripOwnSchemaFromType(retType, schemaName)
+				if t, err := ParseType(cleanRet); err == nil {
 					f.Ret = t
 				} else {
 					// For complex return types like TABLE(...), store as-is.
-					f.Ret = &schema.UnsupportedType{T: retType}
+					f.Ret = &schema.UnsupportedType{T: cleanRet}
 				}
 			}
 			s.Funcs = append(s.Funcs, f)
@@ -1607,17 +1694,22 @@ func (i *inspect) inspectObjects(ctx context.Context, r *schema.Realm, opts *sch
 			cycle             bool
 			ownerTable        sql.NullString
 			ownerColumn       sql.NullString
+			depType           sql.NullString
 		)
-		if err := rows.Scan(&ns, &name, &seqType, &start, &increment, &cache, &minV, &maxV, &cycle, &ownerTable, &ownerColumn); err != nil {
+		if err := rows.Scan(&ns, &name, &seqType, &start, &increment, &cache, &minV, &maxV, &cycle, &ownerTable, &ownerColumn, &depType); err != nil {
 			return fmt.Errorf("postgres: scanning sequence: %w", err)
 		}
 		s, ok := r.Schema(ns)
 		if !ok {
 			return fmt.Errorf("postgres: schema %q for sequence %q not found", ns, name)
 		}
-		// Auto-owned sequences (serial/identity) are managed by the column.
-		// Convert the column to SerialType and skip the sequence.
+		// Auto-owned sequences are managed by the column — skip standalone emission.
 		if ownerTable.Valid && ownerColumn.Valid {
+			if depType.Valid && depType.String == "i" {
+				// Identity columns: sequence is internal, handled by GENERATED AS IDENTITY.
+				continue
+			}
+			// Serial columns: convert to SerialType.
 			convertToSerial(s, ownerTable.String, ownerColumn.String, name)
 			continue
 		}
@@ -4192,6 +4284,24 @@ WHERE
 ORDER BY
 	n.nspname, c.relname
 `
+	// Query to list view columns via pg_attribute.
+	viewColumnsQuery = `
+SELECT
+	n.nspname AS schema_name,
+	c.relname AS view_name,
+	a.attname AS column_name,
+	pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type,
+	NOT a.attnotnull AS is_nullable
+FROM
+	pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE
+	c.relkind IN ('v', 'm')
+	AND n.nspname IN (%s)
+ORDER BY
+	n.nspname, c.relname, a.attnum
+`
 	// Query to list functions and procedures.
 	funcsQuery = `
 SELECT
@@ -4318,12 +4428,13 @@ SELECT
 	s.seqmax AS max_value,
 	s.seqcycle AS cycle,
 	d_table.relname AS owner_table,
-	d_col.attname AS owner_column
+	d_col.attname AS owner_column,
+	dep.deptype AS dep_type
 FROM
 	pg_catalog.pg_sequence s
 	JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
 	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = c.oid AND dep.deptype = 'a' AND dep.classid = 'pg_class'::regclass
+	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = c.oid AND dep.deptype IN ('a', 'i') AND dep.classid = 'pg_class'::regclass
 	LEFT JOIN pg_catalog.pg_class d_table ON d_table.oid = dep.refobjid AND dep.refclassid = 'pg_class'::regclass
 	LEFT JOIN pg_catalog.pg_attribute d_col ON d_col.attrelid = dep.refobjid AND d_col.attnum = dep.refobjsubid
 WHERE
@@ -4509,6 +4620,7 @@ SELECT
 FROM pg_catalog.pg_roles r
 WHERE r.rolname NOT LIKE 'pg_%'
   AND r.rolname != 'postgres'
+  AND r.oid >= 16384
 ORDER BY r.rolname
 `
 	// Query to list role membership for non-system roles.
@@ -4520,6 +4632,7 @@ FROM pg_catalog.pg_auth_members a
 JOIN pg_catalog.pg_roles r ON r.oid = a.member
 JOIN pg_catalog.pg_roles m ON m.oid = a.roleid
 WHERE r.rolname NOT LIKE 'pg_%'
+  AND r.oid >= 16384
 ORDER BY r.rolname, m.rolname
 `
 )

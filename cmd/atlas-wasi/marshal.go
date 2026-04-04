@@ -48,7 +48,7 @@ type flatTable struct {
 }
 
 type flatColumn struct {
-	Name    string          `json:"name"`
+	Name    string          `json:"name,omitempty"`
 	Type    *flatColumnType `json:"type,omitempty"`
 	Default any             `json:"default,omitempty"`
 	Attrs   []any           `json:"attrs,omitempty"`
