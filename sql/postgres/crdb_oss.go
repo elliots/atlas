@@ -178,7 +178,7 @@ func (cd *crdbDiff) normalize(table *schema.Table) {
 }
 
 func (i *inspect) crdbIndexes(ctx context.Context, s *schema.Schema) error {
-	rows, err := i.querySchema(ctx, crdbIndexesQuery, s)
+	rows, err := i.querySchemas(ctx, crdbIndexesQuery, []*schema.Schema{s})
 	if err != nil {
 		return fmt.Errorf("postgres: querying schema %q indexes: %w", s.Name, err)
 	}
@@ -292,7 +292,7 @@ SELECT
 	LEFT JOIN pg_indexes pgi ON pgi.tablename = t.relname AND indexname = i.relname AND n.nspname = pgi.schemaname
 	LEFT JOIN pg_attribute a ON (a.attrelid, a.attnum) = (idx.indrelid, idx.key)
 WHERE
-	n.nspname = $1
+	n.nspname IN (%s)
 	AND t.relname IN (%s)
 ORDER BY
 	table_name, index_name, idx.ord
@@ -300,6 +300,7 @@ ORDER BY
 
 	crdbColumnsQuery = `
 SELECT
+	t1.table_schema,
 	t1.table_name,
 	t1.column_name,
 	t1.data_type,
@@ -334,7 +335,7 @@ FROM
 	LEFT JOIN pg_sequences AS t5
 	ON quote_ident(t5.schemaname) || '.' || quote_ident(t5.sequencename) = btrim(btrim(t1.column_default, 'nextval('''), '''::REGCLASS)')
 WHERE
-	t1.table_schema = $1 AND t1.table_name IN (%s)
+	t1.table_schema IN (%s) AND t1.table_name IN (%s)
 ORDER BY
 	t1.table_name, t1.ordinal_position
 `

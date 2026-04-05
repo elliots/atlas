@@ -254,26 +254,28 @@ func (d *Driver) RealmRestoreFunc(desired *schema.Realm) migrate.RestoreFunc {
 				if err != nil {
 					return err
 				}
-				changes, err := d.RealmDiff(current, desired)
-				if err != nil {
-					return err
+				// Fast path: if already clean, do nothing.
+				if len(current.Schemas) <= 1 && len(current.Objects) == 0 {
+					if len(current.Schemas) == 0 {
+						return nil
+					}
+					if s := current.Schemas[0]; s.Name == "public" && len(s.Tables)+len(s.Views)+len(s.Funcs)+len(s.Procs)+len(s.Objects) == 0 {
+						return nil
+					}
 				}
-				// If there is no diff, do nothing.
-				if len(changes) == 0 {
-					return nil
+				// Batch all cleanup into a single exec to minimize round trips.
+				var stmts []string
+				for _, s := range current.Schemas {
+					stmts = append(stmts, fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", s.Name))
 				}
-				// Else, prefer to drop the public schema and apply
-				// database changes instead of executing changes one by one.
-				if changes, err = d.RealmDiff(current, &schema.Realm{Attrs: desired.Attrs, Objects: desired.Objects}); err != nil {
-					return err
+				for _, o := range current.Objects {
+					if ext, ok := o.(*Extension); ok {
+						stmts = append(stmts, fmt.Sprintf("DROP EXTENSION IF EXISTS %q CASCADE", ext.T))
+					}
 				}
-				if err := d.ApplyChanges(ctx, withCascade(changes)); err != nil {
-					return err
-				}
-				// Recreate the public schema.
-				return d.ApplyChanges(ctx, []schema.Change{
-					&schema.AddSchema{S: pb, Extra: []schema.Clause{&schema.IfExists{}}},
-				})
+				stmts = append(stmts, `CREATE SCHEMA IF NOT EXISTS "public"`)
+				_, err = d.ExecContext(ctx, strings.Join(stmts, ";\n"))
+				return err
 			}
 		}
 	}
@@ -1439,6 +1441,17 @@ func (i *inspect) inspectViews(ctx context.Context, r *schema.Realm, opts *schem
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	// Skip view columns query when no views were found.
+	hasViews := false
+	for _, s := range r.Schemas {
+		if len(s.Views) > 0 {
+			hasViews = true
+			break
+		}
+	}
+	if !hasViews {
+		return nil
 	}
 	// Populate view columns from pg_attribute.
 	return i.inspectViewColumns(ctx, r)

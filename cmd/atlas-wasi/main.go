@@ -182,9 +182,21 @@ func execAndInspect(ctx context.Context, drv migrate.Driver, files []string, fil
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f.Name(), err)
 		}
-		for _, s := range fileStmts {
-			if _, err := drv.ExecContext(ctx, s); err != nil {
-				return nil, fmt.Errorf("%s: %w", f.Name(), err)
+		// Batch statements to reduce bridge round trips (critical for remote databases).
+		// Join up to 50 statements per exec call.
+		for i := 0; i < len(fileStmts); i += 50 {
+			end := i + 50
+			if end > len(fileStmts) {
+				end = len(fileStmts)
+			}
+			batch := strings.Join(fileStmts[i:end], ";\n") + ";"
+			if _, err := drv.ExecContext(ctx, batch); err != nil {
+				// On batch failure, fall back to one-by-one to get precise error
+				for _, s := range fileStmts[i:end] {
+					if _, err := drv.ExecContext(ctx, s); err != nil {
+						return nil, fmt.Errorf("%s: %w", f.Name(), err)
+					}
+				}
 			}
 		}
 	}
@@ -243,9 +255,19 @@ func cmdApply(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error)
 	if err != nil {
 		return nil, err
 	}
-	for _, s := range stmts {
-		if _, err := drv.ExecContext(ctx, s); err != nil {
-			return nil, fmt.Errorf("exec: %w", err)
+	// Batch statements to reduce bridge round trips.
+	for i := 0; i < len(stmts); i += 50 {
+		end := i + 50
+		if end > len(stmts) {
+			end = len(stmts)
+		}
+		batch := strings.Join(stmts[i:end], ";\n") + ";"
+		if _, err := drv.ExecContext(ctx, batch); err != nil {
+			for _, s := range stmts[i:end] {
+				if _, err := drv.ExecContext(ctx, s); err != nil {
+					return nil, fmt.Errorf("exec: %w", err)
+				}
+			}
 		}
 	}
 	return &Result{}, nil
@@ -272,7 +294,11 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 		}
 	}
 
-	// For sides that use SQL files, load them into the dev DB via snapshot
+	// For sides that use SQL files, load them into the dev DB via snapshot.
+	// Optimization: when "from" has no SQL files, the DB stays clean after
+	// From inspection, so we skip the mid-restore (~27 queries + cleanup execs).
+	emptyFrom := fromRealm == nil && len(cmd.From) == 0 && cmd.FromConnection == ""
+
 	if fromRealm == nil || toRealm == nil {
 		sn, ok := drv.(migrate.Snapshoter)
 		if !ok {
@@ -292,8 +318,11 @@ func cmdDiff(ctx context.Context, drv migrate.Driver, cmd Cmd) (*Result, error) 
 		}
 
 		if toRealm == nil {
-			if err := restore(ctx); err != nil {
-				return nil, fmt.Errorf("restore: %w", err)
+			// If From had no SQL files, the DB is still clean — skip the restore.
+			if !emptyFrom {
+				if err := restore(ctx); err != nil {
+					return nil, fmt.Errorf("restore: %w", err)
+				}
 			}
 			toRealm, err = execAndInspect(ctx, drv, cmd.To, nil, cmd.Schema)
 			if err != nil {

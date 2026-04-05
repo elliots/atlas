@@ -185,6 +185,91 @@ func TypedSchemaFKs[T ScanStringer](s *schema.Schema, rows *sql.Rows, attr ...*F
 	return nil
 }
 
+// TypedRealmFKs is like TypedSchemaFKs but resolves the schema from the realm
+// using the tSchema column already scanned from the FK query.
+func TypedRealmFKs[T ScanStringer](r *schema.Realm, rows *sql.Rows, attr ...*FKAttrScanner) error {
+	for rows.Next() {
+		var (
+			updateAction, deleteAction                                   = V(new(T)), V(new(T))
+			name, table, column, tSchema, refTable, refColumn, refSchema string
+			columns                                                      = []any{
+				&name, &table, &column, &tSchema, &refTable, &refColumn, &refSchema, &updateAction, &deleteAction,
+			}
+			origin = len(columns)
+		)
+		switch {
+		case len(attr) > 1:
+			return fmt.Errorf("unexpected number of attributes scanners: %d", len(attr))
+		case len(attr) == 1:
+			columns = append(columns, attr[0].Columns()...)
+		}
+		if err := rows.Scan(columns...); err != nil {
+			return err
+		}
+		s, ok := r.Schema(tSchema)
+		if !ok {
+			continue
+		}
+		t, ok := s.Table(table)
+		if !ok {
+			continue
+		}
+		fk, ok := t.ForeignKey(name)
+		if !ok {
+			fk = &schema.ForeignKey{
+				Symbol:   name,
+				Table:    t,
+				RefTable: t,
+				OnUpdate: schema.ReferenceOption(updateAction.String()),
+				OnDelete: schema.ReferenceOption(deleteAction.String()),
+			}
+			switch {
+			case tSchema == refSchema && refTable == table:
+			case tSchema == refSchema && refTable != table:
+				if fk.RefTable, ok = s.Table(refTable); !ok {
+					fk.RefTable = &schema.Table{Name: refTable, Schema: s}
+				}
+			case tSchema != refSchema:
+				if rs, ok := r.Schema(refSchema); ok {
+					if rt, ok := rs.Table(refTable); ok {
+						fk.RefTable = rt
+					} else {
+						fk.RefTable = &schema.Table{Name: refTable, Schema: rs}
+					}
+				} else {
+					fk.RefTable = &schema.Table{Name: refTable, Schema: &schema.Schema{Name: refSchema}}
+				}
+			}
+			t.ForeignKeys = append(t.ForeignKeys, fk)
+		}
+		c, ok := t.Column(column)
+		if !ok {
+			return fmt.Errorf("column %q was not found for fk %q", column, fk.Symbol)
+		}
+		if _, ok := fk.Column(c.Name); !ok {
+			fk.Columns = append(fk.Columns, c)
+			c.ForeignKeys = append(c.ForeignKeys, fk)
+		}
+		var rc *schema.Column
+		if fk.Table != fk.RefTable {
+			rc = &schema.Column{Name: refColumn}
+		} else if c, ok := t.Column(refColumn); ok {
+			rc = c
+		} else {
+			return fmt.Errorf("referenced column %q was not found for fk %q", refColumn, fk.Symbol)
+		}
+		if _, ok := fk.RefColumn(rc.Name); !ok {
+			fk.RefColumns = append(fk.RefColumns, rc)
+		}
+		if len(attr) == 1 {
+			if err := attr[0].ScanFunc(fk, columns[origin:]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // LinkSchemaTables links foreign-key stub tables/columns to actual elements.
 func LinkSchemaTables(schemas []*schema.Schema) {
 	byName := make(map[string]map[string]*schema.Table)
